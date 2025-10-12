@@ -279,6 +279,7 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
 
     while env.has_any_legal():
         grid_before = env.grid.copy()
+        num_legal_actions = len(env.enumerate_legal())
         box = select_action()
         if box is None:
             break
@@ -292,8 +293,8 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
             "step": step,
             "grid": grid_before.tolist(),     # pre-action state
             "action": {"r1": r1, "c1": c1, "r2": r2, "c2": c2},
+            "num_legal_actions": num_legal_actions,
             "legal": bool(info.valid),
-            "sum": int(info.sum),
             "reward": int(info.reward),
             "done": bool(info.done),
             "agent_tag": policy,
