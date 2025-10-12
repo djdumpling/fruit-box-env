@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
 # ---------- Utilities ----------
 
@@ -281,13 +282,11 @@ def main():
     traj_rows: List[dict] = []
     episode_rows: List[dict] = []
 
-    for i in range(args.episodes):
+    for i in tqdm(range(args.episodes), desc = "Generating episodes"):
         seed = args.seed_start + i
         rows, header = generate_episode(seed = seed, policy = args.policy, H = 10, W = 17)
         traj_rows.extend(rows)
         episode_rows.append(header)
-        if (i + 1) % 10 == 0:
-            print(f"Generated {i+1}/{args.episodes} episodes")
 
     # trajectories format
     if args.format == "jsonl":
