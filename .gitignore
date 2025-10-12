@@ -1,9 +1,3 @@
-# Output data files
-out_data/
-*.jsonl
-*.jsonl.gz
-*.parquet
-
 # Python
 __pycache__/
 *.py[cod]
