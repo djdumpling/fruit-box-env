@@ -173,28 +173,72 @@ def policy_greedy_area(env: Sum10Env) -> Optional[Box]:
     box, _ = max(choices, key = lambda x: x[1])
     return box
 
-# simulate one step and look at max immediate reward next state.
-def policy_look_ahead(env: Sum10Env, lam: float = 0.2) -> Optional[Box]:
+# multi-step lookahead with sampling
+# O(M * sample_size^depth) instead of O(M^depth)
+def policy_look_ahead(env: Sum10Env, depth: int = 1, sample_size: int = 20, discount: float = 0.9) -> Optional[Box]:
+
     choices = env.enumerate_legal()
     if not choices: return None
+    
     best_score = -1
     best_box = None
     original_grid = env.grid.copy()
     original_sum = env.sum.copy()
     original_count = env.count.copy()
     original_turn = env.turn
-
-    for box, reward_now in choices:
+    # recursively evaluate future moves, return best score from this state
+    def eval_move_recursive(current_depth: int, current_discount: float) -> float:
+        if current_depth == 0:
+            return 0.0
+        
+        next_choices = env.enumerate_legal()
+        if not next_choices:
+            return 0.0
+        
+        # sample moves if too many
+        if len(next_choices) > sample_size:
+            indices = env.rng.choice(len(next_choices), size = sample_size, replace = False)
+            next_choices = [next_choices[i] for i in indices]
+        
+        best_future_score = 0.0
+        saved_grid = env.grid.copy()
+        saved_sum = env.sum.copy()
+        saved_count = env.count.copy()
+        saved_turn = env.turn
+        
+        for next_box, next_reward in next_choices:
+            nr1, nc1, nr2, nc2 = next_box
+            
+            # apply move
+            env.grid[nr1:nr2 + 1, nc1:nc2 + 1] = 0
+            env.rebuild_prefix_sums()
+            
+            # recursive lookahead
+            future_score = next_reward + discount * eval_move_recursive(current_depth - 1, current_discount * discount)
+            best_future_score = max(best_future_score, future_score)
+            
+            # rollback
+            env.grid[:] = saved_grid
+            env.sum[:] = saved_sum
+            env.count[:] = saved_count
+            env.turn = saved_turn
+        
+        return best_future_score
+    
+    # evaluate each candidate first move
+    for box, immediate_reward in choices:
         (r1, c1, r2, c2) = box
-
-        # simulate
+        
+        # apply candidate move
         env.grid[r1:r2 + 1, c1:c2 + 1] = 0
         env.rebuild_prefix_sums()
-        next = env.enumerate_legal()
-        reward_next = max((reward for _, reward in next), default = 0)
-        score = reward_now + lam * reward_next
-        if score > best_score:
-            best_score = score
+        
+        # look ahead recursively
+        future_score = eval_move_recursive(depth - 1, discount)
+        total_score = immediate_reward + discount * future_score
+        
+        if total_score > best_score:
+            best_score = total_score
             best_box = box
         
         # rollback
@@ -202,7 +246,7 @@ def policy_look_ahead(env: Sum10Env, lam: float = 0.2) -> Optional[Box]:
         env.sum[:] = original_sum
         env.count[:] = original_count
         env.turn = original_turn
-
+    
     return best_box
 
 # ---------- Generation Loop ----------
@@ -220,13 +264,16 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
         elif policy == "greedy_area":
             return policy_greedy_area(env)
         elif policy.startswith("look_ahead"):
-            # default lambda is 0.2, otherwise parse command input
-            lam = 0.2
+            # format: look_ahead:depth:sample_size:discount
+            depth, sample_size, discount = 1, 20, 0.9
             if ":" in policy:
+                parts = policy.split(":")
                 try:
-                    lam = float(policy.split(":")[1])
+                    if len(parts) > 1: depth = int(parts[1])
+                    if len(parts) > 2: sample_size = int(parts[2])
+                    if len(parts) > 3: discount = float(parts[3])
                 except: pass
-            return policy_look_ahead(env, lam = lam)
+            return policy_look_ahead(env, depth = depth, sample_size = sample_size, discount = discount)
         else:
             raise ValueError(f"unknown policy: {policy}")
 
@@ -272,8 +319,8 @@ def main():
     p.add_argument("--episodes", type = int, default = 100, help = "number of episodes to generate")
     p.add_argument("--seed_start", type = int, default = 1, help = "first RNG seed")
     p.add_argument("--policy", type = str, default = "greedy_area",
-                   choices = ["random_legal", "greedy_area", "look_ahead", "look_ahead:0.3", "look_ahead:0.0"],
-                   help = "scripted policy")
+                   help = "Policy: random_legal | greedy_area | look_ahead[:depth:sample_size:discount]. "
+                          "Example: look_ahead:3:20:0.9 = 3-step lookahead, sample 20 moves per step, discount 0.9")
     p.add_argument("--out_dir", type = str, default = "out_data", help = "output directory")
     p.add_argument("--format", type = str, default = "jsonl", choices = ["jsonl", "parquet"], help = "output format for trajectories")
     args = p.parse_args()
