@@ -173,6 +173,13 @@ def policy_greedy_area(env: Sum10Env) -> Optional[Box]:
     box, _ = max(choices, key = lambda x: x[1])
     return box
 
+# minimize the non-zero count (reward) - opposite of greedy
+def policy_minimal_area(env: Sum10Env) -> Optional[Box]:
+    choices = env.enumerate_legal()
+    if not choices: return None
+    box, _ = min(choices, key = lambda x: x[1])
+    return box
+
 # multi-step lookahead with sampling
 # O(M * sample_size^depth) instead of O(M^depth)
 def policy_look_ahead(env: Sum10Env, depth: int = 1, sample_size: int = 20, discount: float = 0.9) -> Optional[Box]:
@@ -263,6 +270,8 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
             return policy_random_legal(env)
         elif policy == "greedy_area":
             return policy_greedy_area(env)
+        elif policy == "minimal_area":
+            return policy_minimal_area(env)
         elif policy.startswith("look_ahead"):
             # format: look_ahead:depth:sample_size:discount
             depth, sample_size, discount = 1, 20, 0.9
