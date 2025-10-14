@@ -138,7 +138,8 @@ def main():
         'greedy_area': base_dir / 'greedy_area_1k' / 'episodes.jsonl',
         'random_legal': base_dir / 'random_legal_1k' / 'episodes.jsonl',
         'look_ahead': base_dir / 'look_ahead_1k_2_70_0.95' / 'episodes.jsonl',
-        'minimal_area': base_dir / 'minimal_area_1k' / 'episodes.jsonl'
+        'minimal_area': base_dir / 'minimal_area_1k' / 'episodes.jsonl',
+        'high_pairs': base_dir / 'high_pairs_1k' / 'episodes.jsonl'
     }
     
     # load data
