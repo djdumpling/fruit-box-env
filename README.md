@@ -33,6 +33,9 @@ python generate_dataset.py --policy greedy_area --episodes 1000 --out_dir out_da
 # Minimal policy (minimize cells cleared per move - opposite of greedy)
 python generate_dataset.py --policy minimal_area --episodes 1000 --out_dir out_data/minimal_1k
 
+# High-value pairs policy (prioritize (9,1), (8,2), (7,3) pairs first)
+python generate_dataset.py --policy high_value_pairs --episodes 1000 --out_dir out_data/high_value_1k
+
 # Random policy
 python generate_dataset.py --policy random_legal --episodes 1000 --out_dir out_data/random_1k
 

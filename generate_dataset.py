@@ -180,6 +180,38 @@ def policy_minimal_area(env: Sum10Env) -> Optional[Box]:
     box, _ = min(choices, key = lambda x: x[1])
     return box
 
+# prioritize clearing high-value pairs: (9,1), (8,2), (7,3)
+def policy_high_value_pairs(env: Sum10Env) -> Optional[Box]:
+    choices = env.enumerate_legal()
+    if not choices: return None
+    
+    # Check for high-value pairs first
+    high_value_boxes = []
+    for box, reward in choices:
+        r1, c1, r2, c2 = box
+        # only 2-cell rectangles can be high-value pairs
+        if reward == 2: 
+            # extract the two values
+            values = []
+            for r in range(r1, r2 + 1):
+                for c in range(c1, c2 + 1):
+                    if env.grid[r, c] != 0:
+                        values.append(env.grid[r, c])
+            
+            if len(values) == 2:
+                # sort descending
+                values.sort(reverse = True) 
+                if values == [9, 1] or values == [8, 2] or values == [7, 3]:
+                    high_value_boxes.append((box, reward))
+    
+    # return the first one if found
+    if high_value_boxes:
+        return high_value_boxes[0][0]
+    
+    # o.w/, fall back to minimal area strategy
+    box, _ = min(choices, key = lambda x: x[1])
+    return box
+
 # multi-step lookahead with sampling
 # O(M * sample_size^depth) instead of O(M^depth)
 def policy_look_ahead(env: Sum10Env, depth: int = 1, sample_size: int = 20, discount: float = 0.9) -> Optional[Box]:
@@ -272,6 +304,8 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
             return policy_greedy_area(env)
         elif policy == "minimal_area":
             return policy_minimal_area(env)
+        elif policy == "high_value_pairs":
+            return policy_high_value_pairs(env)
         elif policy.startswith("look_ahead"):
             # format: look_ahead:depth:sample_size:discount
             depth, sample_size, discount = 1, 20, 0.9
@@ -326,13 +360,11 @@ def generate_episode(seed, policy = "greedy_area", H = 10, W = 17) -> Tuple[List
 
 def main():
     p = argparse.ArgumentParser(description = "Generate Sum-10 trajectories.")
-    p.add_argument("--episodes", type = int, default = 100, help = "number of episodes to generate")
-    p.add_argument("--seed_start", type = int, default = 1, help = "first RNG seed")
-    p.add_argument("--policy", type = str, default = "greedy_area",
-                   help = "Policy: random_legal | greedy_area | look_ahead[:depth:sample_size:discount]. "
-                          "Example: look_ahead:3:20:0.9 = 3-step lookahead, sample 20 moves per step, discount 0.9")
-    p.add_argument("--out_dir", type = str, default = "out_data", help = "output directory")
-    p.add_argument("--format", type = str, default = "jsonl", choices = ["jsonl", "parquet"], help = "output format for trajectories")
+    p.add_argument("--episodes", type = int, default = 1000)
+    p.add_argument("--seed_start", type = int, default = 1)
+    p.add_argument("--policy", type = str, default = "greedy_area")
+    p.add_argument("--out_dir", type = str, default = "out_data")
+    p.add_argument("--format", type = str, default = "jsonl", choices = ["jsonl", "parquet"])
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
