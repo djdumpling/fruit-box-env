@@ -45,7 +45,8 @@ def write_parquet(df: pd.DataFrame):
     print(f"Wrote {path} rows={len(df)}")
 
 def main():
-    policy_dirs = [p for p in IN_ROOT.iterdir() if p.is_dir() and (p/"trajectories.parquet").exists()]
+    # excluding high_pairs since its basically same as minimal area
+    policy_dirs = [p for p in IN_ROOT.iterdir() if p.is_dir() and (p/"trajectories.parquet").exists() and p.name != "high_pairs_1k"]
     dfs = [read_policy_df(p) for p in policy_dirs]
     df = pd.concat(dfs, ignore_index = True)
     
