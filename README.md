@@ -27,28 +27,30 @@ pip install numpy pandas matplotlib seaborn tqdm pyarrow
 Generate episodes using different policies:
 
 ```bash
-# Greedy policy (maximize cells cleared per move)
+# greedy policy (maximize cells cleared per move)
 python generate_dataset.py --policy greedy_area --episodes 1000 --out_dir out_data/greedy_1k
 
-# Minimal policy (minimize cells cleared per move - opposite of greedy)
+# minimal policy (minimize cells cleared per move - opposite of greedy)
 python generate_dataset.py --policy minimal_area --episodes 1000 --out_dir out_data/minimal_1k
 
-# High-value pairs policy (prioritize (9,1), (8,2), (7,3) pairs first)
+# high-value pairs policy (prioritize (9,1), (8,2), (7,3) pairs first)
 python generate_dataset.py --policy high_value_pairs --episodes 1000 --out_dir out_data/high_value_1k
 
-# Random policy
+# random policy
 python generate_dataset.py --policy random_legal --episodes 1000 --out_dir out_data/random_1k
 
-# Look-ahead policy (3-step depth, sample 20 moves, discount 0.95)
+# look-ahead policy (3-step depth, sample 20 moves, discount 0.95)
 python generate_dataset.py --policy look_ahead:3:20:0.95 --episodes 1000 --out_dir out_data/lookahead_1k
 ```
 
 **Output formats**: `jsonl` (default) or `parquet`
 
 ```bash
-# Generate as parquet
+# add --format parquet at the end
 python generate_dataset.py --policy greedy_area --episodes 100 --format parquet
 ```
+
+Download the HF data [here](https://huggingface.co/datasets/djdumpling/fruit-box).
 
 ## 📈 Policy Analysis
 
