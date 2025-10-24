@@ -16,6 +16,22 @@ GAME_RULES = textwrap.dedent(
     
     You are playing Fruit Box, a puzzle game on a 10×17 grid filled with digits 1-9.
     
+    ## CRITICAL: JSON Response Format
+    You MUST respond with ONLY a valid JSON object. No other text, explanations, or markdown.
+    
+    ## VERIFICATION PROCESS
+    Before selecting any move, you MUST:
+    1. Identify the exact coordinates (r1,c1) to (r2,c2)
+    2. Read the actual values at those coordinates from the grid
+    3. Verify the sum equals exactly 10
+    
+    Valid move format:
+    {"reasoning": "Carefully describe your strategy, verifying sums until you find a valid entry.", 
+     "action": {"r1": 0, "c1": 0, "r2": 1, "c2": 1}}
+    
+    No valid moves format:
+    {"reasoning": "No valid moves found", "action": {"r1": -1, "c1": -1, "r2": -1, "c2": -1}}
+    
     ## Objective
     Select axis-aligned rectangles where the sum of all numbers equals exactly 10.
     When you select a valid rectangle, those cells are cleared (set to 0) and you 
@@ -34,35 +50,16 @@ GAME_RULES = textwrap.dedent(
     - Reward = number of non-zero cells cleared
     - Game ends when no legal moves remain
     
-    ## Response Format
-    Respond with a JSON object containing your move:
-    {
-      "reasoning": "<careful explanation of your strategy>",
-      "action": {
-        "r1": <row_start>,
-        "c1": <col_start>,
-        "r2": <row_end>,
-        "c2": <col_end>
-      }
-    }
-    
-    ## No Valid Moves
-    If you cannot find any valid move that sums to exactly 10, respond with:
-    {
-      "reasoning": "No valid moves found",
-      "action": {
-        "r1": -1,
-        "c1": -1,
-        "r2": -1,
-        "c2": -1
-      }
-    }
-    
     ## Strategy Tips
     - Higher rewards come from clearing more cells at once
     - Plan ahead - some numbers can only form 10 with specific partners
     - Large numbers (like 9) need to be paired with 1, limiting options
     - Consider which moves preserve future opportunities
+    
+    ## WARNING
+    - Read grid values slowly and accurately
+    - If unsure, re-read the grid and recalculate
+    - Common errors: misreading numbers, wrong coordinates
     """
 ).strip()
 
@@ -290,91 +287,11 @@ def load_environment(
         expert_reward = state["info"]["total_reward"]
         return min(1.0, total_reward / expert_reward) if expert_reward > 0 else 0.0
     
-    def reward_efficiency(completion: List[dict], state: dict, **kwargs) -> float:
-        initial_grid = state["info"]["initial_grid"]
-        env = Sum10Env()
-        env.reset(grid=np.array(initial_grid))
-        
-        total_reward = 0
-        valid_moves = 0
-        assistant_messages = [m for m in completion if m["role"] == "assistant"]
-        
-        for msg in assistant_messages:
-            action = parse_action(msg["content"])
-            if action is None:
-                continue
-            
-            step_info = env.step(
-                action.get("r1", -1),
-                action.get("c1", -1),
-                action.get("r2", -1),
-                action.get("c2", -1)
-            )
-            
-            if step_info.valid:
-                total_reward += step_info.reward
-                valid_moves += 1
-            else:
-                break
-            
-            if step_info.done:
-                break
-        
-        if valid_moves == 0:
-            return 0.0
-        
-        efficiency = total_reward / valid_moves
-        expert_reward = state["info"]["total_reward"]
-        expert_steps = state["info"]["total_steps"]
-        expert_efficiency = expert_reward / expert_steps if expert_steps > 0 else 0
-        
-        return min(1.0, efficiency / expert_efficiency) if expert_efficiency > 0 else 0.0
     
-    def reward_validity(completion: List[dict], state: dict, **kwargs) -> float:
-        assistant_messages = [m for m in completion if m["role"] == "assistant"]
-        
-        if not assistant_messages:
-            return 0.0
-        
-        initial_grid = state["info"]["initial_grid"]
-        env = Sum10Env()
-        env.reset(grid=np.array(initial_grid))
-        
-        valid_count = 0
-        total_count = 0
-        
-        for msg in assistant_messages:
-            action = parse_action(msg["content"])
-            if action is None:
-                total_count += 1
-                continue
-            
-            total_count += 1
-            step_info = env.step(
-                action.get("r1", -1),
-                action.get("c1", -1),
-                action.get("r2", -1),
-                action.get("c2", -1)
-            )
-            
-            if step_info.valid:
-                valid_count += 1
-            else:
-                break
-            
-            if step_info.done:
-                break
-        
-        return valid_count / total_count if total_count > 0 else 0.0
-    
-    # need to probably think more about how to calibrate the final reward
+    # create rubric with only total score reward
     rubric = vf.Rubric(
-        funcs=[
-            reward_total_score,
-            reward_efficiency,
-            reward_validity,
-        ],
-        weights=[0.7, 0.2, 0.1]
+        funcs=[reward_total_score],
+        weights=[1.0]
     )
     
     dataset = build_dataset()

@@ -38,6 +38,8 @@ async def run_single_trajectory():
     ]
 
     print_grid(game_env.grid)
+    print(f"\n=== Initial Grid (JSON) ===")
+    print(grid_json)
     
     # 170/2 = 85 is max num terms 
     total_reward = 0
@@ -45,15 +47,13 @@ async def run_single_trajectory():
     max_turns = 85
     
     while turn < max_turns:
-        turn += 1
-        print(f"\n=== Turn {turn} ===")
+        print(f"\n=== Turn {turn + 1} ===")
         
         try:
             response = await client.chat.completions.create(
                 model="gpt-4.1-2025-04-14",
                 messages=messages,
-                temperature=0.5,
-                max_tokens=1000
+                temperature=0.5
             )
             
             assistant_message = response.choices[0].message.content
@@ -118,6 +118,7 @@ async def run_single_trajectory():
                 break
             
             # valid move, so update
+            turn += 1
             total_reward += step_info.reward
             print(f"✓ Valid! Cleared {step_info.reward} cells. Total: {total_reward}")
             messages.append({"role": "assistant", "content": assistant_message})
@@ -145,8 +146,6 @@ async def run_single_trajectory():
     print(f"{'='*30}")
     print(f"Turns: {turn}")
     print(f"Total Reward: {total_reward}")
-    print(f"Efficiency: {total_reward/turn:.2f} cells/move")
-    print(f"Performance: {100*total_reward/example['info']['total_reward']:.1f}% of expert")
     
     return total_reward, turn
 
