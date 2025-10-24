@@ -37,12 +37,24 @@ GAME_RULES = textwrap.dedent(
     ## Response Format
     Respond with a JSON object containing your move:
     {
-      "reasoning": "<brief explanation of your strategy>",
+      "reasoning": "<careful explanation of your strategy>",
       "action": {
         "r1": <row_start>,
         "c1": <col_start>,
         "r2": <row_end>,
         "c2": <col_end>
+      }
+    }
+    
+    ## No Valid Moves
+    If you cannot find any valid move that sums to exactly 10, respond with:
+    {
+      "reasoning": "No valid moves found",
+      "action": {
+        "r1": -1,
+        "c1": -1,
+        "r2": -1,
+        "c2": -1
       }
     }
     
@@ -53,21 +65,6 @@ GAME_RULES = textwrap.dedent(
     - Consider which moves preserve future opportunities
     """
 ).strip()
-
-# def format_grid(grid: List[List[int]]) -> str:
-#     if isinstance(grid, np.ndarray):
-#         grid = grid.tolist()
-    
-#     lines = []
-#     col_header = "   " + " ".join(f"{i:2d}" for i in range(len(grid[0])))
-#     lines.append(col_header)
-#     lines.append("   " + "---" * len(grid[0]))
-    
-#     for r, row in enumerate(grid):
-#         row_str = f"{r:2d}|" + " ".join(f"{cell:2d}" for cell in row)
-#         lines.append(row_str)
-    
-#     return "\n".join(lines)
 
 def load_environment(
     dataset_name: str = "djdumpling/fruit-box",
@@ -171,9 +168,9 @@ def load_environment(
             if assistant_count >= max_turns:
                 return True
             
-            # Check if last move indicated game over
+            # if last move indicated game over
             if assistant_count > 0:
-                # Parse last assistant message to check if game ended
+                # parse last assistant message to check if game ended
                 last_response = messages[-1]["content"] if messages[-1]["role"] == "assistant" else None
                 if last_response:
                     try:
@@ -200,6 +197,18 @@ def load_environment(
             c1 = action.get("c1", -1)
             r2 = action.get("r2", -1)
             c2 = action.get("c2", -1)
+            
+            # check for "no valid moves" signal
+            if r1 == -1 and c1 == -1 and r2 == -1 and c2 == -1:
+                response = {
+                    "valid": False,
+                    "reason": "No valid moves found",
+                    "reward": 0,
+                    "done": True,
+                    "grid": state.get("current_grid", state["info"]["initial_grid"]),
+                    "message": "No valid moves available. Game over."
+                }
+                return [{"role": "user", "content": json.dumps(response)}], state
             
             # simulate move on a copy
             current_grid = state.get("current_grid", state["info"]["initial_grid"])
@@ -241,6 +250,10 @@ def load_environment(
             parsed = json.loads(content)
             action = parsed.get("action", {})
             if all(k in action for k in ["r1", "c1", "r2", "c2"]):
+                # Check for "no valid moves" signal
+                if (action.get("r1") == -1 and action.get("c1") == -1 and 
+                    action.get("r2") == -1 and action.get("c2") == -1):
+                    return None
                 return action
         except:
             return None
@@ -273,12 +286,11 @@ def load_environment(
             if step_info.done:
                 break
         
-        # Normalize by expert performance
+        # normalize by expert performance
         expert_reward = state["info"]["total_reward"]
         return min(1.0, total_reward / expert_reward) if expert_reward > 0 else 0.0
     
     def reward_efficiency(completion: List[dict], state: dict, **kwargs) -> float:
-        """Reward based on reward per turn (efficiency)."""
         initial_grid = state["info"]["initial_grid"]
         env = Sum10Env()
         env.reset(grid=np.array(initial_grid))
@@ -355,13 +367,14 @@ def load_environment(
         
         return valid_count / total_count if total_count > 0 else 0.0
     
+    # need to probably think more about how to calibrate the final reward
     rubric = vf.Rubric(
         funcs=[
             reward_total_score,
             reward_efficiency,
             reward_validity,
         ],
-        weights=[0.5, 0.3, 0.2]
+        weights=[0.7, 0.2, 0.1]
     )
     
     dataset = build_dataset()
@@ -431,7 +444,6 @@ class Sum10Env:
         return self.box_query(self.count, r1, c1, r2, c2)
     
     def enumerate_legal(self):
-        """Return list of ((r1,c1,r2,c2), reward) for all legal rectangles."""
         out = []
         for r1, c1, r2, c2 in self.boxes:
             if self.box_sum(r1, c1, r2, c2) == 10:
@@ -454,7 +466,7 @@ class Sum10Env:
         if c1 > c2:
             c1, c2 = c2, c1
         
-        # Check valid bounds, valid sum, and valid clear
+        # check valid bounds, valid sum, and valid clear
         s = self.box_sum(r1, c1, r2, c2)
         reward = self.box_nonzero_count(r1, c1, r2, c2)
 
