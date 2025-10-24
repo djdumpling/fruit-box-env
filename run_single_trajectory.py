@@ -9,6 +9,12 @@ from fruit_box import load_environment, Sum10Env, GAME_RULES
 
 load_dotenv()
 
+def print_grid(grid):
+    print("\n=== Grid Visualization ===")
+    for i, row in enumerate(grid):
+        print(f" ".join(f"{cell:2d}" for cell in row))
+    print()
+
 async def run_single_trajectory():
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     
@@ -30,9 +36,8 @@ async def run_single_trajectory():
     messages = [
         {"role": "user", "content": user_prompt}
     ]
-    
-    print(f"\n=== Initial Grid (JSON) ===")
-    print(grid_json)
+
+    print_grid(game_env.grid)
     
     # 170/2 = 85 is max num terms 
     total_reward = 0
@@ -41,7 +46,7 @@ async def run_single_trajectory():
     
     while turn < max_turns:
         turn += 1
-        print(f"\n--- Turn {turn} ---")
+        print(f"\n=== Turn {turn} ===")
         
         try:
             response = await client.chat.completions.create(
@@ -120,6 +125,9 @@ async def run_single_trajectory():
             if step_info.done:
                 print("\nGame Complete - No more legal moves!")
                 break
+            
+            # show updated grid
+            print_grid(game_env.grid)
             
             # send updated grid
             grid_json = json.dumps({"grid": game_env.grid.tolist()})
