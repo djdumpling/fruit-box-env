@@ -76,9 +76,9 @@ def load_environment(
     def build_dataset() -> Dataset:
         random.seed(seed)
         
-        print(f"Loading dataset {dataset_name} (split: {dataset_split})...")
         hf_dataset = load_dataset(dataset_name, split=dataset_split)
-        
+        print(f"Loaded dataset {dataset_name} (split: {dataset_split})...")
+                
         # group trajectories by episode_id and agent_tag
         episodes = {}
         for row in hf_dataset:
