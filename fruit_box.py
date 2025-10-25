@@ -26,11 +26,12 @@ GAME_RULES = textwrap.dedent(
     3. Verify the sum equals exactly 10
     
     Valid move format:
-    {"reasoning": "Carefully describe your strategy, verifying sums until you find a valid entry.", 
-     "action": {"r1": 0, "c1": 0, "r2": 1, "c2": 1}}
+    {"reasoning": "Brief description of your search and the move found.", 
+     "action": {"r1": 0, "c1": 0, "r2": 1, "c2": 1},
+     "candidate_moves": [{"r1": 0, "c1": 0, "r2": 1, "c2": 1}, {"r1": 2, "c1": 3, "r2": 2, "c2": 4}]}
     
     No valid moves format:
-    {"reasoning": "No valid moves found", "action": {"r1": -1, "c1": -1, "r2": -1, "c2": -1}}
+    {"reasoning": "Searched systematically but found no valid moves", "action": {"r1": -1, "c1": -1, "r2": -1, "c2": -1}, "candidate_moves": []}
     
     ## Objective
     Select axis-aligned rectangles where the sum of all numbers equals exactly 10.
@@ -56,6 +57,13 @@ GAME_RULES = textwrap.dedent(
     - Large numbers (like 9) need to be paired with 1, limiting options
     - Consider which moves preserve future opportunities
     
+    ## SEARCH STRATEGY
+    - Check rows 0-9 systematically for adjacent pairs that sum to 10
+    - Check columns 0-16 systematically for adjacent pairs that sum to 10  
+    - Look for 2x2 and 3x3 blocks that sum to 10
+    - After each move, re-check the area around cleared cells for new opportunities
+    - Don't stop after finding one move - look for multiple moves
+    
     ## WARNING
     - Read grid values slowly and accurately
     - If unsure, re-read the grid and recalculate
@@ -64,7 +72,7 @@ GAME_RULES = textwrap.dedent(
 ).strip()
 
 def load_environment(
-    dataset_name: str = "djdumpling/fruit-box",
+    dataset_name: str = "djdumpling/fruit-box-minimal-area",
     dataset_split: str = "train",
     max_turns: int = 70,
     seed: int = 42,

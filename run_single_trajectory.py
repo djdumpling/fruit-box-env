@@ -74,6 +74,7 @@ async def run_single_trajectory():
                 parsed = json.loads(content)
                 action = parsed.get("action", {})
                 reasoning = parsed.get("reasoning", "")
+                candidate_moves = parsed.get("candidate_moves", [])
             except json.JSONDecodeError:
                 # o.w/, use regex
                 import re
@@ -84,6 +85,7 @@ async def run_single_trajectory():
                 if match:
                     r1, c1, r2, c2 = map(int, match.groups())
                     action = {"r1": r1, "c1": c1, "r2": r2, "c2": c2}
+                    candidate_moves = []
                 else:
                     print("Error: Could not parse JSON or extract coordinates")
                     break
@@ -102,6 +104,12 @@ async def run_single_trajectory():
             print(f"Action: ({r1},{c1}) -> ({r2},{c2})")
             if reasoning:
                 print(f"Reasoning: {reasoning}")
+            if candidate_moves:
+                print(f"Candidate moves found: {len(candidate_moves)}")
+                for i, move in enumerate(candidate_moves[:5]):  # Show first 5
+                    print(f"  {i+1}. ({move.get('r1', '?')},{move.get('c1', '?')}) -> ({move.get('r2', '?')},{move.get('c2', '?')})")
+                if len(candidate_moves) > 5:
+                    print(f"  ... and {len(candidate_moves) - 5} more")
             
             actual_sum = game_env.box_sum(r1, c1, r2, c2) if (
                 0 <= r1 <= r2 < 10 and 0 <= c1 <= c2 < 17
