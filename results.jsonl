@@ -1,0 +1,1 @@
+{"seed": 882, "openai/gpt-5": {"total_reward": 112, "total_steps": 48}, "minimal_area_1k": {"total_reward": 118, "total_steps": 53}, "greedy_area_1k": {"total_reward": 118, "total_steps": 49}, "look_ahead_1k_2_70_0.95": {"total_reward": 114, "total_steps": 45}, "random_legal_1k": {"total_reward": 115, "total_steps": 49}}

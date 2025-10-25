@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 import openai
+import argparse
 
 from dotenv import load_dotenv
 from fruit_box import load_environment, Sum10Env, GAME_RULES
@@ -14,7 +15,7 @@ def print_grid(grid):
         print(f" ".join(f"{cell:2d}" for cell in row))
     print()
 
-def run_single_trajectory(seed=None):
+def run_single_trajectory(seed=None, model="openai/gpt-5"):
     client = openai.OpenAI(
     api_key=os.environ.get("PRIME_API_KEY"),
     base_url="https://api.pinference.ai/api/v1")
@@ -62,7 +63,7 @@ def run_single_trajectory(seed=None):
         
         try:
             response = client.chat.completions.create(
-                model="openai/gpt-5",
+                model=model,
                 messages=messages
             )
             
@@ -168,5 +169,10 @@ def run_single_trajectory(seed=None):
     return total_reward, turn
 
 if __name__ == "__main__":
-    print("=== Model: openai/gpt-5 ===\n")
-    run_single_trajectory()
+    parser = argparse.ArgumentParser(description = "Run a single trajectory")
+    parser.add_argument("-m", "--model", default = "openai/gpt-5", help = "Model to use (default: openai/gpt-5)")
+    parser.add_argument("-s", "--seed", type = int, default = 42, help = "Random seed (default: 42)")
+    args = parser.parse_args()
+    
+    print(f"=== Model: {args.model} ===\n")
+    run_single_trajectory(seed = args.seed, model = args.model)
