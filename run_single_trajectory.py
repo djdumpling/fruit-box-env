@@ -15,11 +15,21 @@ def print_grid(grid):
         print(f" ".join(f"{cell:2d}" for cell in row))
     print()
 
-async def run_single_trajectory():
+async def run_single_trajectory(seed=None):
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     
-    env_loader = load_environment(seed=42)
-    example = env_loader.dataset[0]
+    env_loader = load_environment(seed=seed if seed is not None else 42)
+    
+    # Find the episode with the specific seed
+    example = None
+    for item in env_loader.dataset:
+        if item["info"]["rng_seed"] == (seed if seed is not None else 42):
+            example = item
+            break
+    
+    if example is None:
+        raise ValueError(f"Seed {seed if seed is not None else 42} not found in dataset")
+    
     initial_grid = example['info']['initial_grid']
     
     print(f"\n=== Starting New Game ===")
@@ -51,9 +61,8 @@ async def run_single_trajectory():
         
         try:
             response = await client.chat.completions.create(
-                model="gpt-4.1-2025-04-14",
-                messages=messages,
-                temperature=0.5
+                model="o3-2025-04-16",
+                messages=messages
             )
             
             assistant_message = response.choices[0].message.content
@@ -158,5 +167,5 @@ async def run_single_trajectory():
     return total_reward, turn
 
 if __name__ == "__main__":
-    print("=== Model: gpt-4.1-2025-04-14 ===\n")
+    print("=== Model: o3-2025-04-16 ===\n")
     asyncio.run(run_single_trajectory())
