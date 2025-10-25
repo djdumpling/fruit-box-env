@@ -1,13 +1,12 @@
 import json
 import random
-import asyncio
 import os
 from run_single_trajectory import run_single_trajectory
 
-async def run_o3_on_seed(seed: int) -> dict:
+def run_o3_on_seed(seed: int) -> dict:
     print(f"Running o3 on seed {seed}...")
     
-    total_reward, total_steps = await run_single_trajectory(seed=seed)
+    total_reward, total_steps = run_single_trajectory(seed=seed)
     
     return {
         "seed": seed,
@@ -37,7 +36,7 @@ def load_policy_results():
     
     return results
 
-async def main():
+def main():
     random.seed(42)
     test_seeds = random.sample(range(1, 1001), 5)
     print(f"Testing seeds: {test_seeds}")
@@ -47,7 +46,7 @@ async def main():
     o3_results = []
     for seed in test_seeds:
         try:
-            result = await run_o3_on_seed(seed)
+            result = run_o3_on_seed(seed)
             o3_results.append(result)
             print(f"o3 seed {seed}: {result['total_reward']} reward, {result['total_steps']} steps")
         except Exception as e:
@@ -100,4 +99,4 @@ async def main():
                 print(f"  {policy}: {policy_reward} reward (o3 +{diff})")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

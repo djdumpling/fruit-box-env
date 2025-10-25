@@ -1,10 +1,9 @@
 import os
 import json
-import asyncio
 import numpy as np
+import openai
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from fruit_box import load_environment, Sum10Env, GAME_RULES
 
 load_dotenv()
@@ -15,8 +14,10 @@ def print_grid(grid):
         print(f" ".join(f"{cell:2d}" for cell in row))
     print()
 
-async def run_single_trajectory(seed=None):
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def run_single_trajectory(seed=None):
+    client = openai.OpenAI(
+    api_key=os.environ.get("PRIME_API_KEY"),
+    base_url="https://api.pinference.ai/api/v1")
     
     env_loader = load_environment(seed=seed if seed is not None else 42)
     
@@ -60,8 +61,8 @@ async def run_single_trajectory(seed=None):
         print(f"\n=== Turn {turn + 1} ===")
         
         try:
-            response = await client.chat.completions.create(
-                model="o3-2025-04-16",
+            response = client.chat.completions.create(
+                model="openai/gpt-5",
                 messages=messages
             )
             
@@ -167,5 +168,5 @@ async def run_single_trajectory(seed=None):
     return total_reward, turn
 
 if __name__ == "__main__":
-    print("=== Model: o3-2025-04-16 ===\n")
-    asyncio.run(run_single_trajectory())
+    print("=== Model: openai/gpt-5 ===\n")
+    run_single_trajectory()
