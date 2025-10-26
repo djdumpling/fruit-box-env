@@ -72,6 +72,12 @@ GAME_RULES = textwrap.dedent(
     """
 ).strip()
 
+FOLLOW_UP = textwrap.dedent(
+    """
+    Make your next move! Output the same JSON format as before.
+    """
+).strip()
+
 def load_environment(
     dataset_name: str = "djdumpling/fruit-box-minimal-area",
     dataset_split: str = "train",
@@ -226,6 +232,10 @@ def load_environment(
             state["current_grid"] = new_grid
             state["turn"] = turn_num
             
+            # Track total reward
+            if step_info.valid:
+                state["total_reward"] = state.get("total_reward", 0) + step_info.reward
+            
             if not step_info.valid:
                 response = {
                     "valid": False,
@@ -246,10 +256,11 @@ def load_environment(
             
             if step_info.done:
                 response["message"] = "No more legal moves available."
+                return [{"role": "user", "content": json.dumps(response)}], state
             else:
-                response["message"] = f"Valid. Cleared {step_info.reward} cells. Make your next move."
-            
-            return [{"role": "user", "content": json.dumps(response)}], state
+                # Use FOLLOW_UP for subsequent turns instead of repeating full rules
+                follow_up_message = f"Valid! Cleared {step_info.reward} cells. Total reward: {state.get('total_reward', 0) + step_info.reward}.\n\n{FOLLOW_UP}\n\n{json.dumps({'grid': new_grid})}"
+                return [{"role": "user", "content": follow_up_message}], state
     
     def parse_action(content: str) -> Optional[Dict]:
         try:
