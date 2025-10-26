@@ -10,7 +10,6 @@ import verifiers as vf
 from verifiers.envs.multiturn_env import MultiTurnEnv
 from verifiers.types import Messages, State
 
-# need to determine whether adding candidates is actually needed
 GAME_RULES = textwrap.dedent(
     """
     # Fruit Box Game Rules
@@ -27,12 +26,11 @@ GAME_RULES = textwrap.dedent(
     3. Verify the sum equals exactly 10
     
     Valid move format:
-    {"reasoning": "Brief description of your search and the move found.", 
-     "action": {"r1": 0, "c1": 0, "r2": 1, "c2": 1},
-     "candidate_moves": [{"r1": 0, "c1": 0, "r2": 1, "c2": 1}, {"r1": 2, "c1": 3, "r2": 2, "c2": 4}]}
+    {"reasoning": "description of searching for a valid move and verifying that it works.", 
+     "action": {"r1": 0, "c1": 0, "r2": 1, "c2": 1}}
     
     No valid moves format:
-    {"reasoning": "Searched systematically but found no valid moves", "action": {"r1": -1, "c1": -1, "r2": -1, "c2": -1}, "candidate_moves": []}
+    {"reasoning": "Searched systematically but found no valid moves", "action": {"r1": -1, "c1": -1, "r2": -1, "c2": -1}}
     
     ## Objective
     Select axis-aligned rectangles where the sum of all numbers equals exactly 10.
