@@ -10,6 +10,7 @@ import verifiers as vf
 from verifiers.envs.multiturn_env import MultiTurnEnv
 from verifiers.types import Messages, State
 
+# need to determine whether adding candidates is actually needed
 GAME_RULES = textwrap.dedent(
     """
     # Fruit Box Game Rules
