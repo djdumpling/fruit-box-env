@@ -1,8 +1,8 @@
 [project]
-name = "fruit-box-env"
+name = "fruit-box"
+description = "text-based muli-turn fruit box game environment"
+tags = ["strategy", "multi-turn", "grid-based"]
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "argparse>=1.4.0",
@@ -18,3 +18,7 @@ dependencies = [
     "typing>=3.10.0.0",
     "verifiers>=0.1.5.post0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
