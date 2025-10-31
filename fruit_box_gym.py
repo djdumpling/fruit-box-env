@@ -42,6 +42,11 @@ class FruitBoxGymEnv(gym.Env):
         self.turn_count = 0
         self.total_steps = 0
         self.episode_info = {}
+    
+    def get_legal_actions(self) -> list:
+        """Return list of legal actions as tuples (r1, c1, r2, c2)."""
+        legal_moves = self.game_env.enumerate_legal()
+        return [(r1, c1, r2, c2) for ((r1, c1, r2, c2), _) in legal_moves]
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -93,6 +98,7 @@ class FruitBoxGymEnv(gym.Env):
             self.consecutive_invalid_moves += 1
             self.total_steps += 1
             terminated = False
+            truncated = False
 
             if self.terminate_on_invalid or self.consecutive_invalid_moves >= self.max_invalid_moves:
                 terminated = True
@@ -205,10 +211,3 @@ class FruitBoxGymEnv(gym.Env):
             return img_rgb
         
         return None
-
-    def get_legal_actions(self) -> list:
-        legal_moves = self.game_env.enumerate_legal()
-        return [(r1, c1, r2, c2) for ((r1, c1, r2, c2), _) in legal_moves]
-
-    def get_legal_actions_count(self) -> int:
-        return len(self.game_env.enumerate_legal())
