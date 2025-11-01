@@ -29,3 +29,6 @@ uv.lock
 .DS_Store
 Thumbs.db
 
+# Wandb (log to website only, not locally tracked)
+wandb/
+
