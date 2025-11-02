@@ -88,6 +88,17 @@ def compute_grpo_loss(
             
             # Handle any invalid mappings (shouldn't happen, but clamp to valid range)
             batch_actions_compact = torch.clamp(batch_actions_compact, 0, valid_count - 1)
+            
+            # Validation: ensure all mapped indices are valid
+            # Check that no mapped indices are -1 (invalid mapping)
+            invalid_mask = batch_actions_compact < 0
+            if invalid_mask.any():
+                # Fallback: set invalid mappings to 0 (safest default)
+                batch_actions_compact[invalid_mask] = 0
+            
+            # Assert all compact indices are in valid range [0, valid_count-1]
+            assert (batch_actions_compact >= 0).all(), f"Found negative compact indices: {batch_actions_compact[batch_actions_compact < 0]}"
+            assert (batch_actions_compact < valid_count).all(), f"Found compact indices >= valid_count ({valid_count}): {batch_actions_compact[batch_actions_compact >= valid_count]}"
         else:
             # Edge case: no valid indices
             batch_actions_compact = torch.zeros_like(batch_actions_original)

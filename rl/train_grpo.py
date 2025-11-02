@@ -40,11 +40,14 @@ class Config:
     max_updates: int = 2000
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    clip_eps: float = 0.2
+    clip_eps: float = 0.2  # Standard PPO clipping - 0.15 was too conservative and prevented learning
     lr: float = 3e-4
-    entropy_coef: float = 0.02  # Increased from 0.01 for more exploration
-    value_coef: float = 0.5
-    epochs: int = 4
+    lr_schedule: bool = False  # Disabled - was causing issues, learning rate should be stable
+    entropy_coef: float = 0.01  # Reduced from 0.02 - entropy ~5 indicates coefficient is too high
+    entropy_schedule: bool = False  # Disabled - was keeping entropy too high
+    value_coef: float = 0.5  # Standard value coefficient
+    value_clip: float = 10.0  # Clip absolute value error (not squared) - 10 allows learning while preventing extreme updates
+    epochs: int = 4  # Reduced back to 4 - 6 epochs was causing overfitting
     grad_clip: float = 1.0
     grpo_k: int = 10  # Increased from 6 for better exploration
     curriculum_updates: int = 500  # Increased from 200 for longer curriculum
@@ -243,11 +246,61 @@ def visualize_action(
     print("=" * 70 + "\n")
 
 
-def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 500):
+def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 500, illegal_penalty: float = -0.02):
     """Create environment."""
     env = Sum10GymEnv(initial_grid=initial_grid)
-    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
+    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates, illegal_penalty=illegal_penalty)
     return env
+
+
+def get_lr_schedule(update: int, base_lr: float, curriculum_updates: int, max_updates: int) -> float:
+    """Learning rate schedule that reduces LR around curriculum transitions.
+    
+    Reduces LR by 50% during curriculum transitions (updates 450-550 and 950-1050)
+    to help stabilize training during action space changes.
+    """
+    if not (450 <= update <= 550 or 950 <= update <= 1050):
+        return base_lr
+    
+    # Within transition window, linearly reduce LR
+    if 450 <= update <= 550:
+        progress = (update - 450) / 100.0  # 0.0 to 1.0
+        # Reduce from base_lr to 0.5 * base_lr, then back up
+        if progress < 0.5:
+            lr_mult = 1.0 - 0.5 * progress * 2  # 1.0 -> 0.5
+        else:
+            lr_mult = 0.5 + 0.5 * (progress - 0.5) * 2  # 0.5 -> 1.0
+    else:  # 950 <= update <= 1050
+        progress = (update - 950) / 100.0
+        if progress < 0.5:
+            lr_mult = 1.0 - 0.5 * progress * 2
+        else:
+            lr_mult = 0.5 + 0.5 * (progress - 0.5) * 2
+    
+    return base_lr * lr_mult
+
+
+def get_entropy_schedule(update: int, base_entropy_coef: float, curriculum_updates: int) -> float:
+    """Entropy coefficient schedule to stabilize oscillations.
+    
+    Increases entropy slightly during curriculum transitions to encourage exploration,
+    then gradually reduces it to stabilize policy.
+    """
+    if update < curriculum_updates:
+        # During strict curriculum: use base coefficient
+        return base_entropy_coef
+    elif update < curriculum_updates * 2:
+        # During annealing: slightly increase entropy for exploration
+        anneal_progress = (update - curriculum_updates) / curriculum_updates
+        # Increase by 20% at start of annealing, then gradually reduce
+        multiplier = 1.2 * (1.0 - anneal_progress * 0.5)  # 1.2 -> 0.6
+        return base_entropy_coef * multiplier
+    else:
+        # After curriculum: gradually reduce entropy to stabilize
+        post_curriculum_updates = update - curriculum_updates * 2
+        # Reduce entropy over next 500 updates
+        multiplier = max(0.5, 1.0 - post_curriculum_updates / 500.0)
+        return base_entropy_coef * multiplier
 
 
 def collect_rollouts(
@@ -379,6 +432,19 @@ def collect_rollouts(
                 candidates_original_indices = valid_indices[candidates]  # Map to original indices
                 
                 # Simulate each candidate to get rewards
+                # Apply gradual penalty during annealing phase (same as in wrapper.step())
+                if current_update is not None and current_update >= config.curriculum_updates:
+                    if current_update < config.curriculum_updates * 2:
+                        # Gradual penalty during annealing: start at 0, linearly increase to full penalty
+                        anneal_progress = (current_update - config.curriculum_updates) / config.curriculum_updates
+                        scaled_penalty = config.illegal_penalty * anneal_progress
+                    else:
+                        # Full penalty after annealing
+                        scaled_penalty = config.illegal_penalty
+                else:
+                    # No penalty during strict phase (only legal actions allowed)
+                    scaled_penalty = 0.0
+                
                 candidates_rewards = []
                 for k in range(config.grpo_k):
                     # Use the original index from the valid_mask
@@ -387,20 +453,28 @@ def collect_rollouts(
                         anchor_idx,
                         candidates_original_indices[k].item(),
                         env,
-                        illegal_penalty=config.illegal_penalty,
+                        illegal_penalty=scaled_penalty,
                     )
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
                 
                 # Enhanced debug logging for candidate rewards (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
+                    reward_std = candidates_rewards.std().item()
+                    reward_mean = candidates_rewards.mean().item()
+                    # Compute relative advantages to check if they're meaningful
+                    relative_advantages = candidates_rewards - reward_mean
+                    max_abs_advantage = relative_advantages.abs().max().item()
+                    
                     wandb.log({
-                        "debug/phase1_candidate_rewards_mean": candidates_rewards.mean().item(),
-                        "debug/phase1_candidate_rewards_std": candidates_rewards.std().item(),
+                        "debug/phase1_candidate_rewards_mean": reward_mean,
+                        "debug/phase1_candidate_rewards_std": reward_std,
                         "debug/phase1_candidate_rewards_min": candidates_rewards.min().item(),
                         "debug/phase1_candidate_rewards_max": candidates_rewards.max().item(),
                         "debug/phase1_num_legal_candidates": (candidates_rewards > 0).sum().item(),
-                        "debug/phase1_num_penalized_candidates": (candidates_rewards == config.illegal_penalty).sum().item(),
+                        "debug/phase1_num_penalized_candidates": (candidates_rewards == scaled_penalty).sum().item() if abs(scaled_penalty) > 1e-6 else 0,
+                        "debug/phase1_max_abs_advantage": max_abs_advantage,
+                        "debug/phase1_scaled_penalty": scaled_penalty,
                     }, commit=False)
                 
                 # Store candidates with original indices for consistency
@@ -551,8 +625,11 @@ def train(config: Config, use_wandb: bool = True):
                 "gae_lambda": config.gae_lambda,
                 "clip_eps": config.clip_eps,
                 "lr": config.lr,
+                "lr_schedule": config.lr_schedule,
                 "entropy_coef": config.entropy_coef,
+                "entropy_schedule": config.entropy_schedule,
                 "value_coef": config.value_coef,
+                "value_clip": config.value_clip,
                 "epochs": config.epochs,
                 "grad_clip": config.grad_clip,
                 "grpo_k": config.grpo_k,
@@ -587,7 +664,7 @@ def train(config: Config, use_wandb: bool = True):
     for i in range(config.num_envs):
         if (i + 1) % 10 == 0:
             print(f"  Created {i+1}/{config.num_envs} environments...")
-        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates)
+        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates, illegal_penalty=config.illegal_penalty)
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
@@ -612,6 +689,18 @@ def train(config: Config, use_wandb: bool = True):
         # Update curriculum
         for env in envs:
             env.set_curriculum_update(update)
+        
+        # Update learning rate schedule (disabled by default)
+        if config.lr_schedule:
+            current_lr = get_lr_schedule(update, config.lr, config.curriculum_updates, config.max_updates)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+        
+        # Get current entropy coefficient (scheduled, disabled by default)
+        if config.entropy_schedule:
+            current_entropy_coef = get_entropy_schedule(update, config.entropy_coef, config.curriculum_updates)
+        else:
+            current_entropy_coef = config.entropy_coef
         
         # Collect rollouts
         visualize_this_update = (update % config.render_interval == 0)
@@ -656,10 +745,15 @@ def train(config: Config, use_wandb: bool = True):
         phase0_returns_flat = phase0_returns.reshape(-1)
         phase0_masks_flat = phase0_data["masks"].reshape(-1, phase0_data["masks"].shape[-1])
         
-        # Normalize advantages
-        phase0_advantages_flat = (phase0_advantages_flat - phase0_advantages_flat.mean()) / (
-            phase0_advantages_flat.std() + 1e-8
-        )
+        # Normalize advantages (with guard against zero std when all rewards are zero)
+        advantage_mean = phase0_advantages_flat.mean()
+        advantage_std = phase0_advantages_flat.std()
+        if advantage_std < 1e-8:
+            # If all advantages are the same (e.g., all rewards are 0), don't normalize
+            # This prevents division by zero and preserves any signal
+            phase0_advantages_flat = phase0_advantages_flat - advantage_mean
+        else:
+            phase0_advantages_flat = (phase0_advantages_flat - advantage_mean) / advantage_std
         
         # Update Phase-0 (PPO)
         phase0_losses = []
@@ -688,7 +782,8 @@ def train(config: Config, use_wandb: bool = True):
                     batch_masks,
                     config.clip_eps,
                     config.value_coef,
-                    config.entropy_coef,
+                    current_entropy_coef,
+                    value_clip=config.value_clip if hasattr(config, 'value_clip') else None,
                 )
                 
                 optimizer.zero_grad()
@@ -804,18 +899,25 @@ def train(config: Config, use_wandb: bool = True):
             
             # Log to wandb
             if use_wandb:
-                wandb.log({
+                log_dict = {
                     "update": update,
                     "phase0/ppo_loss": avg_phase0_loss.get('ppo_loss', 0),
                     "phase0/policy_loss": avg_phase0_loss.get('policy_loss', 0),
                     "phase0/value_loss": avg_phase0_loss.get('value_loss', 0),
                     "phase0/entropy": avg_phase0_loss.get('entropy', 0),
                     "phase0/clip_fraction": avg_phase0_loss.get('clip_fraction', 0),
-                }, step=update)
+                }
+                # Log learning rate and entropy coefficient if schedules are enabled
+                if config.lr_schedule:
+                    log_dict["train/learning_rate"] = optimizer.param_groups[0]['lr']
+                if config.entropy_schedule:
+                    log_dict["train/entropy_coef"] = current_entropy_coef
+                wandb.log(log_dict, step=update)
         
         if phase1_losses:
             avg_phase1_loss = {k: np.mean([d[k] for d in phase1_losses]) for k in phase1_losses[0]}
-            print(f"Update {update}: Phase-1 loss: {avg_phase1_loss.get('grpo_loss', 0):.4f}")
+            num_phase1_samples = len(phase1_data["obs"]) if len(phase1_data["obs"]) > 0 else 0
+            print(f"Update {update}: Phase-1 loss: {avg_phase1_loss.get('grpo_loss', 0):.4f} (samples: {num_phase1_samples})")
             
             # Log to wandb
             if use_wandb:
@@ -825,6 +927,7 @@ def train(config: Config, use_wandb: bool = True):
                     "phase1/mean_advantage": avg_phase1_loss.get('mean_advantage', 0),
                     "phase1/mean_ratio": avg_phase1_loss.get('mean_ratio', 0),
                     "phase1/clip_fraction": avg_phase1_loss.get('clip_fraction', 0),
+                    "phase1/num_samples": num_phase1_samples,
                 }, step=update)
         
         # Log rollout statistics

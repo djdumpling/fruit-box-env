@@ -20,10 +20,12 @@ class TwoPhaseWrapper(gym.Wrapper):
         env,
         curriculum_legal_only: bool = True,
         curriculum_updates: int = 200,
+        illegal_penalty: float = -0.05,
     ):
         super().__init__(env)
         self.curriculum_legal_only = curriculum_legal_only
         self.curriculum_updates = curriculum_updates
+        self.illegal_penalty = illegal_penalty
         self.current_update = 0
         
         # Phase state: 0 = selecting anchor, 1 = selecting extent
@@ -108,18 +110,21 @@ class TwoPhaseWrapper(gym.Wrapper):
                     # Strict phase: only legal actions
                     mask = mask & legal_mask
                 else:
-                    # Annealing phase: gradually mix in illegal actions
+                    # Annealing phase: start from legal actions, gradually add illegal ones
+                    mask = legal_mask.clone()  # Start with only legal actions
                     anneal_progress = (self.current_update - self.curriculum_updates) / self.curriculum_updates
-                    # Use legal actions + sample illegal actions with increasing probability
+                    # Sample illegal actions with increasing probability
                     illegal_mask = ~legal_mask
-                    # Start allowing 10% of illegal actions, gradually increase to 100%
+                    # Gradually increase from 0% to 100% of illegal actions
                     num_illegal = illegal_mask.sum().item()
                     if num_illegal > 0:
-                        num_to_allow = max(1, int(num_illegal * 0.1 * anneal_progress))
+                        # Ensure we reach 100% by update 1000 (when anneal_progress = 1.0)
+                        num_to_allow = max(1, int(num_illegal * anneal_progress))
                         illegal_indices = torch.nonzero(illegal_mask, as_tuple=False).squeeze(-1)
                         if len(illegal_indices) > 0:
-                            # Randomly sample illegal actions to allow
+                            # Clamp to ensure we don't exceed available illegal actions
                             num_to_allow = min(num_to_allow, len(illegal_indices))
+                            # Randomly sample illegal actions to allow
                             perm = torch.randperm(len(illegal_indices))[:num_to_allow]
                             selected_illegal = illegal_indices[perm]
                             mask[selected_illegal] = True
@@ -208,11 +213,21 @@ class TwoPhaseWrapper(gym.Wrapper):
             multi_action = np.array([r1, c1, r2, c2], dtype=np.int32)
             obs, reward, terminated, truncated, info = self.env.step(multi_action)
             
-            # Apply curriculum penalty if needed
+            # Apply curriculum penalty with gradual annealing
+            # During strict phase (0-499): no penalty needed (only legal actions allowed)
+            # During annealing phase (500-999): gradually increase penalty
+            # After annealing (1000+): full penalty
             if self.current_update >= self.curriculum_updates:
                 # Check if move was illegal (sum != 10)
                 if not info.get("valid", True):
-                    reward += -0.05  # penalty for illegal rectangle
+                    if self.current_update < self.curriculum_updates * 2:
+                        # Gradual penalty during annealing: start at 0, linearly increase to full penalty
+                        anneal_progress = (self.current_update - self.curriculum_updates) / self.curriculum_updates
+                        scaled_penalty = self.illegal_penalty * anneal_progress
+                        reward += scaled_penalty
+                    else:
+                        # Full penalty after annealing
+                        reward += self.illegal_penalty
             
             # Reset phase state
             self.phase = 0
