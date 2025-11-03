@@ -1,7 +1,7 @@
 """PPO (Proximal Policy Optimization) utilities."""
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict
 
 
 def compute_gae(
@@ -66,8 +66,7 @@ def compute_ppo_loss(
     action_mask: torch.Tensor,
     clip_eps: float = 0.2,
     value_coef: float = 0.5,
-    entropy_coef: float = 0.01,
-    value_clip: Optional[float] = None,
+    entropy_coef: float = 0.01
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute PPO clipped loss.
     
@@ -114,16 +113,8 @@ def compute_ppo_loss(
     policy_loss2 = clipped_ratio * advantages
     policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
     
-    # Value loss (MSE, optionally clipped)
-    # NOTE: value_clip now clips the absolute error, not the squared error
-    # This prevents extreme value updates while still allowing learning
-    if value_clip is not None and value_clip > 0:
-        value_error = returns - values
-        # Clip absolute error, then square for MSE
-        value_error_clipped = torch.clamp(value_error, -value_clip, value_clip)
-        value_loss = (value_error_clipped ** 2).mean()
-    else:
-        value_loss = ((values - returns) ** 2).mean()
+    # Value loss (MSE)
+    value_loss = ((values - returns) ** 2).mean()
     
     # Entropy bonus
     entropy_bonus = entropies.mean()
@@ -140,6 +131,7 @@ def compute_ppo_loss(
         "mean_advantage": advantages.mean().item(),
         "mean_ratio": ratio.mean().item(),
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),
+        # Note: new_logprobs is not included as it's a tensor used only for KL computation
     }
     
     return loss, info

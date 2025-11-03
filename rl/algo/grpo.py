@@ -88,17 +88,6 @@ def compute_grpo_loss(
             
             # Handle any invalid mappings (shouldn't happen, but clamp to valid range)
             batch_actions_compact = torch.clamp(batch_actions_compact, 0, valid_count - 1)
-            
-            # Validation: ensure all mapped indices are valid
-            # Check that no mapped indices are -1 (invalid mapping)
-            invalid_mask = batch_actions_compact < 0
-            if invalid_mask.any():
-                # Fallback: set invalid mappings to 0 (safest default)
-                batch_actions_compact[invalid_mask] = 0
-            
-            # Assert all compact indices are in valid range [0, valid_count-1]
-            assert (batch_actions_compact >= 0).all(), f"Found negative compact indices: {batch_actions_compact[batch_actions_compact < 0]}"
-            assert (batch_actions_compact < valid_count).all(), f"Found compact indices >= valid_count ({valid_count}): {batch_actions_compact[batch_actions_compact >= valid_count]}"
         else:
             # Edge case: no valid indices
             batch_actions_compact = torch.zeros_like(batch_actions_original)
@@ -135,11 +124,22 @@ def compute_grpo_loss(
     loss = -torch.min(loss1, loss2).mean()
     
     # Statistics
+    reward_std = rewards.std().item()
+    reward_range = rewards.max().item() - rewards.min().item()
+    rel_adv_std = advantages.std().item()
+    
+    # Count unique rewards (another diversity metric)
+    unique_rewards = len(torch.unique(rewards))
+    
     info = {
         "grpo_loss": loss.item(),
         "mean_advantage": advantages.mean().item(),
         "mean_ratio": ratio.mean().item(),
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),
+        "reward_diversity_std": reward_std,  # Standard deviation of rewards within group
+        "reward_range": reward_range,  # Range of rewards (max - min)
+        "relative_advantage_std": rel_adv_std,  # Std of relative advantages (key diversity metric)
+        "unique_reward_count": unique_rewards,  # Number of distinct reward values
     }
     
     return loss, info

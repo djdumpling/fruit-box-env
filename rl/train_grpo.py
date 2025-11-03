@@ -35,29 +35,50 @@ from fruit_box import Sum10Env
 @dataclass
 class Config:
     """Training configuration."""
-    num_envs: int = 2
-    rollout_steps: int = 256
+    # Data collection
+    num_envs: int = 16
+    rollout_steps: int = 512
+    batch_size: int = 1024
+    epochs: int = 3
+    
+    # Phase-0 (PPO) hyperparameters
+    phase0_lr: float = 1e-4
+    phase0_clip_eps: float = 0.12
+    phase0_target_kl: float = 0.015
+    phase0_value_coef: float = 0.8
+    
+    # Phase-1 (GRPO) hyperparameters
+    phase1_lr: float = 1e-3
+    phase1_clip_eps: float = 0.3
+    grpo_k: int = 32
+    grpo_tau: float = 0.7  # For advantage smoothing/weighting
+    frozen_refresh_interval: int = 75  # Refresh frozen policy every N updates
+    grpo_temperature: float = 1.0  # Temperature for candidate sampling (higher = more diverse)
+    min_reward_std: float = 0.01  # Minimum reward std for meaningful learning signal
+    
+    # Shared hyperparameters
     max_updates: int = 2000
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    clip_eps: float = 0.2  # Standard PPO clipping - 0.15 was too conservative and prevented learning
-    lr: float = 3e-4
-    lr_schedule: bool = False  # Disabled - was causing issues, learning rate should be stable
-    entropy_coef: float = 0.01  # Reduced from 0.02 - entropy ~5 indicates coefficient is too high
-    entropy_schedule: bool = False  # Disabled - was keeping entropy too high
-    value_coef: float = 0.5  # Standard value coefficient
-    value_clip: float = 10.0  # Clip absolute value error (not squared) - 10 allows learning while preventing extreme updates
-    epochs: int = 4  # Reduced back to 4 - 6 epochs was causing overfitting
+    entropy_coef: float = 0.02
     grad_clip: float = 1.0
-    grpo_k: int = 10  # Increased from 6 for better exploration
-    curriculum_updates: int = 500  # Increased from 200 for longer curriculum
-    illegal_penalty: float = -0.02  # Reduced from -0.05 to be less harsh
-    batch_size: int = 64
+    lr_warmup_steps: int = 20  # Learning rate warmup steps (recommended: 10-20)
+    
+    # Curriculum learning
+    curriculum_updates: int = 400  # Sigmoid annealing over 400 updates
+    illegal_penalty: float = -0.02
+    
+    # Behavior cloning (BC-KL annealing from 0.01 to 0)
+    bc_kl_coef_start: float = 0.01
+    bc_kl_coef_end: float = 0.0
+    bc_kl_anneal_updates: int = 400  # Anneal over same period as curriculum
+    
+    # Other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 1000
-    render_interval: int = 5  # Show visualization every N updates
-    render_env_idx: int = 0  # Which environment to visualize
+    render_interval: int = 5
+    render_env_idx: int = 0
 
 
 class RolloutBuffer:
@@ -246,61 +267,11 @@ def visualize_action(
     print("=" * 70 + "\n")
 
 
-def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 500, illegal_penalty: float = -0.02):
+def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
     """Create environment."""
     env = Sum10GymEnv(initial_grid=initial_grid)
-    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates, illegal_penalty=illegal_penalty)
+    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
     return env
-
-
-def get_lr_schedule(update: int, base_lr: float, curriculum_updates: int, max_updates: int) -> float:
-    """Learning rate schedule that reduces LR around curriculum transitions.
-    
-    Reduces LR by 50% during curriculum transitions (updates 450-550 and 950-1050)
-    to help stabilize training during action space changes.
-    """
-    if not (450 <= update <= 550 or 950 <= update <= 1050):
-        return base_lr
-    
-    # Within transition window, linearly reduce LR
-    if 450 <= update <= 550:
-        progress = (update - 450) / 100.0  # 0.0 to 1.0
-        # Reduce from base_lr to 0.5 * base_lr, then back up
-        if progress < 0.5:
-            lr_mult = 1.0 - 0.5 * progress * 2  # 1.0 -> 0.5
-        else:
-            lr_mult = 0.5 + 0.5 * (progress - 0.5) * 2  # 0.5 -> 1.0
-    else:  # 950 <= update <= 1050
-        progress = (update - 950) / 100.0
-        if progress < 0.5:
-            lr_mult = 1.0 - 0.5 * progress * 2
-        else:
-            lr_mult = 0.5 + 0.5 * (progress - 0.5) * 2
-    
-    return base_lr * lr_mult
-
-
-def get_entropy_schedule(update: int, base_entropy_coef: float, curriculum_updates: int) -> float:
-    """Entropy coefficient schedule to stabilize oscillations.
-    
-    Increases entropy slightly during curriculum transitions to encourage exploration,
-    then gradually reduces it to stabilize policy.
-    """
-    if update < curriculum_updates:
-        # During strict curriculum: use base coefficient
-        return base_entropy_coef
-    elif update < curriculum_updates * 2:
-        # During annealing: slightly increase entropy for exploration
-        anneal_progress = (update - curriculum_updates) / curriculum_updates
-        # Increase by 20% at start of annealing, then gradually reduce
-        multiplier = 1.2 * (1.0 - anneal_progress * 0.5)  # 1.2 -> 0.6
-        return base_entropy_coef * multiplier
-    else:
-        # After curriculum: gradually reduce entropy to stabilize
-        post_curriculum_updates = update - curriculum_updates * 2
-        # Reduce entropy over next 500 updates
-        multiplier = max(0.5, 1.0 - post_curriculum_updates / 500.0)
-        return base_entropy_coef * multiplier
 
 
 def collect_rollouts(
@@ -423,28 +394,23 @@ def collect_rollouts(
                     logits, _ = frozen_policy(phase1_obs[i:i+1], full_mask.unsqueeze(0))
                     # Extract only valid logits
                     valid_logits = logits[0][:valid_action_count]
-                    dist = torch.distributions.Categorical(logits=valid_logits)
-                    candidates = dist.sample((config.grpo_k,))  # [K] - indices into compact valid space [0, valid_action_count)
-                    candidates_logprobs = dist.log_prob(candidates)  # [K]
+                    
+                    # Apply temperature for diversity (higher temp = more exploration)
+                    # Temperature scaling: logits / temperature
+                    scaled_logits = valid_logits / max(config.grpo_temperature, 1e-8)
+                    
+                    dist_scaled = torch.distributions.Categorical(logits=scaled_logits)
+                    candidates = dist_scaled.sample((config.grpo_k,))  # [K] - indices into compact valid space [0, valid_action_count)
+                    
+                    # Compute logprobs with original (unscaled) logits for correct probability
+                    dist_original = torch.distributions.Categorical(logits=valid_logits)
+                    candidates_logprobs = dist_original.log_prob(candidates)  # [K]
                 
                 # Convert candidate indices back to original mask indices
                 # candidates are indices [0, valid_action_count), need to map to actual valid_indices
                 candidates_original_indices = valid_indices[candidates]  # Map to original indices
                 
                 # Simulate each candidate to get rewards
-                # Apply gradual penalty during annealing phase (same as in wrapper.step())
-                if current_update is not None and current_update >= config.curriculum_updates:
-                    if current_update < config.curriculum_updates * 2:
-                        # Gradual penalty during annealing: start at 0, linearly increase to full penalty
-                        anneal_progress = (current_update - config.curriculum_updates) / config.curriculum_updates
-                        scaled_penalty = config.illegal_penalty * anneal_progress
-                    else:
-                        # Full penalty after annealing
-                        scaled_penalty = config.illegal_penalty
-                else:
-                    # No penalty during strict phase (only legal actions allowed)
-                    scaled_penalty = 0.0
-                
                 candidates_rewards = []
                 for k in range(config.grpo_k):
                     # Use the original index from the valid_mask
@@ -453,29 +419,39 @@ def collect_rollouts(
                         anchor_idx,
                         candidates_original_indices[k].item(),
                         env,
-                        illegal_penalty=scaled_penalty,
+                        illegal_penalty=config.illegal_penalty,
                     )
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
                 
+                # Check reward diversity - critical for GRPO
+                reward_std = candidates_rewards.std().item()
+                reward_range = candidates_rewards.max().item() - candidates_rewards.min().item()
+                
                 # Enhanced debug logging for candidate rewards (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
-                    reward_std = candidates_rewards.std().item()
-                    reward_mean = candidates_rewards.mean().item()
-                    # Compute relative advantages to check if they're meaningful
-                    relative_advantages = candidates_rewards - reward_mean
-                    max_abs_advantage = relative_advantages.abs().max().item()
+                    # Compute relative advantages for diversity metric
+                    mean_reward = candidates_rewards.mean().item()
+                    rel_advantages = candidates_rewards - mean_reward
+                    rel_adv_std = rel_advantages.std().item()
                     
                     wandb.log({
-                        "debug/phase1_candidate_rewards_mean": reward_mean,
+                        "debug/phase1_candidate_rewards_mean": candidates_rewards.mean().item(),
                         "debug/phase1_candidate_rewards_std": reward_std,
+                        "debug/phase1_candidate_rewards_range": reward_range,
+                        "debug/phase1_reward_diversity": rel_adv_std,  # Key metric: std of relative advantages
                         "debug/phase1_candidate_rewards_min": candidates_rewards.min().item(),
                         "debug/phase1_candidate_rewards_max": candidates_rewards.max().item(),
                         "debug/phase1_num_legal_candidates": (candidates_rewards > 0).sum().item(),
-                        "debug/phase1_num_penalized_candidates": (candidates_rewards == scaled_penalty).sum().item() if abs(scaled_penalty) > 1e-6 else 0,
-                        "debug/phase1_max_abs_advantage": max_abs_advantage,
-                        "debug/phase1_scaled_penalty": scaled_penalty,
+                        "debug/phase1_num_penalized_candidates": (candidates_rewards == config.illegal_penalty).sum().item(),
                     }, commit=False)
+                
+                # Note: Low reward diversity is expected for this task (most legal moves clear 2 cells, some 3, rarely 4)
+                # This means GRPO relative advantages will be small, but that's inherent to the reward structure
+                # The warning is disabled since this is expected behavior, not a bug
+                # if reward_std < config.min_reward_std and current_update is not None and current_update % 100 == 0:
+                #     print(f"Info: Low reward diversity (std={reward_std:.4f}, range={reward_range:.2f}) at update {current_update}. "
+                #           f"This is expected - most legal moves clear 2 cells, so relative advantages will be small.")
                 
                 # Store candidates with original indices for consistency
                 all_candidates_actions.append(candidates_original_indices)
@@ -623,19 +599,24 @@ def train(config: Config, use_wandb: bool = True):
                 "max_updates": config.max_updates,
                 "gamma": config.gamma,
                 "gae_lambda": config.gae_lambda,
-                "clip_eps": config.clip_eps,
-                "lr": config.lr,
-                "lr_schedule": config.lr_schedule,
+                "phase0_lr": config.phase0_lr,
+                "phase0_clip_eps": config.phase0_clip_eps,
+                "phase0_target_kl": config.phase0_target_kl,
+                "phase0_value_coef": config.phase0_value_coef,
+                "phase1_lr": config.phase1_lr,
+                "phase1_clip_eps": config.phase1_clip_eps,
                 "entropy_coef": config.entropy_coef,
-                "entropy_schedule": config.entropy_schedule,
-                "value_coef": config.value_coef,
-                "value_clip": config.value_clip,
                 "epochs": config.epochs,
                 "grad_clip": config.grad_clip,
                 "grpo_k": config.grpo_k,
+                "grpo_tau": config.grpo_tau,
+                "grpo_temperature": config.grpo_temperature,
+                "frozen_refresh_interval": config.frozen_refresh_interval,
                 "curriculum_updates": config.curriculum_updates,
                 "illegal_penalty": config.illegal_penalty,
                 "batch_size": config.batch_size,
+                "lr_warmup_steps": config.lr_warmup_steps,
+                "min_reward_std": config.min_reward_std,
                 "seed": config.seed,
             },
             tags=["grpo", "fruit-box", "two-phase"],
@@ -664,7 +645,7 @@ def train(config: Config, use_wandb: bool = True):
     for i in range(config.num_envs):
         if (i + 1) % 10 == 0:
             print(f"  Created {i+1}/{config.num_envs} environments...")
-        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates, illegal_penalty=config.illegal_penalty)
+        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates)
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
@@ -673,9 +654,25 @@ def train(config: Config, use_wandb: bool = True):
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     print("Policy created")
     
-    print("Creating optimizer...")
-    optimizer = torch.optim.Adam(policy.parameters(), lr=config.lr)
-    print("Optimizer created")
+    # Create separate optimizers for Phase-0 and Phase-1
+    # Learning rates will be warmed up during training
+    print("Creating optimizers...")
+    phase0_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase0_lr)
+    phase1_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase1_lr)
+    print("Optimizers created")
+    
+    # Learning rate warmup helper function
+    def get_lr_multiplier(step: int, warmup_steps: int) -> float:
+        """Get learning rate multiplier for warmup."""
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        return 1.0
+    
+    # Create frozen policy for GRPO candidate sampling
+    frozen_policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
+    frozen_policy.load_state_dict(policy.state_dict())
+    frozen_policy.eval()
+    print("Frozen policy created")
     
     # Create buffer
     print("Creating buffer...")
@@ -686,27 +683,29 @@ def train(config: Config, use_wandb: bool = True):
     # Training loop
     global_step = 0
     for update in tqdm(range(config.max_updates), desc="Training"):
+        # Learning rate warmup (recommended: 10-20 steps)
+        lr_mult = get_lr_multiplier(update, config.lr_warmup_steps)
+        if lr_mult < 1.0:
+            for param_group in phase0_optimizer.param_groups:
+                param_group['lr'] = config.phase0_lr * lr_mult
+            for param_group in phase1_optimizer.param_groups:
+                param_group['lr'] = config.phase1_lr * lr_mult
+        
         # Update curriculum
         for env in envs:
             env.set_curriculum_update(update)
         
-        # Update learning rate schedule (disabled by default)
-        if config.lr_schedule:
-            current_lr = get_lr_schedule(update, config.lr, config.curriculum_updates, config.max_updates)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
-        
-        # Get current entropy coefficient (scheduled, disabled by default)
-        if config.entropy_schedule:
-            current_entropy_coef = get_entropy_schedule(update, config.entropy_coef, config.curriculum_updates)
-        else:
-            current_entropy_coef = config.entropy_coef
+        # Refresh frozen policy periodically
+        if update > 0 and update % config.frozen_refresh_interval == 0:
+            frozen_policy.load_state_dict(policy.state_dict())
+            frozen_policy.eval()
+            print(f"Frozen policy refreshed at update {update}")
         
         # Collect rollouts
         visualize_this_update = (update % config.render_interval == 0)
         visualization_data = collect_rollouts(
             envs, policy, buffer, config,
-            frozen_policy=None,
+            frozen_policy=frozen_policy,
             visualize=visualize_this_update,
             render_env_idx=config.render_env_idx,
             current_update=update,
@@ -745,15 +744,15 @@ def train(config: Config, use_wandb: bool = True):
         phase0_returns_flat = phase0_returns.reshape(-1)
         phase0_masks_flat = phase0_data["masks"].reshape(-1, phase0_data["masks"].shape[-1])
         
-        # Normalize advantages (with guard against zero std when all rewards are zero)
-        advantage_mean = phase0_advantages_flat.mean()
-        advantage_std = phase0_advantages_flat.std()
-        if advantage_std < 1e-8:
-            # If all advantages are the same (e.g., all rewards are 0), don't normalize
-            # This prevents division by zero and preserves any signal
-            phase0_advantages_flat = phase0_advantages_flat - advantage_mean
-        else:
-            phase0_advantages_flat = (phase0_advantages_flat - advantage_mean) / advantage_std
+        # Normalize returns
+        phase0_returns_flat = (phase0_returns_flat - phase0_returns_flat.mean()) / (
+            phase0_returns_flat.std() + 1e-8
+        )
+        
+        # Scale advantages so std(A) ≈ 1
+        adv_std = phase0_advantages_flat.std()
+        if adv_std > 1e-8:
+            phase0_advantages_flat = phase0_advantages_flat / adv_std
         
         # Update Phase-0 (PPO)
         phase0_losses = []
@@ -780,16 +779,32 @@ def train(config: Config, use_wandb: bool = True):
                     batch_advantages,
                     batch_returns,
                     batch_masks,
-                    config.clip_eps,
-                    config.value_coef,
-                    current_entropy_coef,
-                    value_clip=config.value_clip if hasattr(config, 'value_clip') else None,
+                    config.phase0_clip_eps,
+                    config.phase0_value_coef,
+                    config.entropy_coef,
                 )
                 
-                optimizer.zero_grad()
+                # Check KL constraint (compute KL divergence)
+                # We need to compute new logprobs to check KL
+                with torch.no_grad():
+                    logits, _ = policy(batch_obs, batch_masks)
+                    new_logprobs_batch = []
+                    for b in range(batch_obs.size(0)):
+                        valid_mask = batch_masks[b]
+                        valid_logits = logits[b][valid_mask]
+                        dist = torch.distributions.Categorical(logits=valid_logits)
+                        new_logprobs_batch.append(dist.log_prob(batch_actions[b]))
+                    new_logprobs_batch = torch.stack(new_logprobs_batch)
+                    
+                    kl_div = (batch_old_logprobs - new_logprobs_batch).mean().item()
+                    if kl_div > config.phase0_target_kl:
+                        # Skip update if KL too large
+                        continue
+                
+                phase0_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
-                optimizer.step()
+                phase0_optimizer.step()
                 
                 phase0_losses.append(info)
         
@@ -882,42 +897,61 @@ def train(config: Config, use_wandb: bool = True):
                         padded_logprobs,
                         padded_rewards,
                         batch_masks,
-                        config.clip_eps,
+                        config.phase1_clip_eps,
                     )
                     
-                    optimizer.zero_grad()
+                    phase1_optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
-                    optimizer.step()
+                    phase1_optimizer.step()
                     
                     phase1_losses.append(info)
         
         # Logging
         if phase0_losses:
-            avg_phase0_loss = {k: np.mean([d[k] for d in phase0_losses]) for k in phase0_losses[0]}
-            print(f"Update {update}: Phase-0 loss: {avg_phase0_loss.get('ppo_loss', 0):.4f}")
+            # Convert all tensor values to scalars before averaging
+            # Skip tensors that aren't scalar metrics (like 'new_logprobs')
+            phase0_losses_scalar = []
+            for d in phase0_losses:
+                scalar_dict = {}
+                for k, v in d.items():
+                    if k == 'new_logprobs':
+                        # Skip this - it's a tensor used only for KL check
+                        continue
+                    if isinstance(v, torch.Tensor):
+                        if v.numel() == 1:
+                            scalar_dict[k] = v.item()
+                        else:
+                            # Skip multi-element tensors
+                            continue
+                    else:
+                        scalar_dict[k] = v
+                phase0_losses_scalar.append(scalar_dict)
+            
+            if phase0_losses_scalar and len(phase0_losses_scalar) > 0:
+                avg_phase0_loss = {k: np.mean([d[k] for d in phase0_losses_scalar]) for k in phase0_losses_scalar[0]}
+                print(f"Update {update}: Phase-0 loss: {avg_phase0_loss.get('ppo_loss', 0):.4f}")
             
             # Log to wandb
             if use_wandb:
-                log_dict = {
+                wandb.log({
                     "update": update,
                     "phase0/ppo_loss": avg_phase0_loss.get('ppo_loss', 0),
                     "phase0/policy_loss": avg_phase0_loss.get('policy_loss', 0),
                     "phase0/value_loss": avg_phase0_loss.get('value_loss', 0),
                     "phase0/entropy": avg_phase0_loss.get('entropy', 0),
                     "phase0/clip_fraction": avg_phase0_loss.get('clip_fraction', 0),
-                }
-                # Log learning rate and entropy coefficient if schedules are enabled
-                if config.lr_schedule:
-                    log_dict["train/learning_rate"] = optimizer.param_groups[0]['lr']
-                if config.entropy_schedule:
-                    log_dict["train/entropy_coef"] = current_entropy_coef
-                wandb.log(log_dict, step=update)
+                }, step=update)
         
         if phase1_losses:
-            avg_phase1_loss = {k: np.mean([d[k] for d in phase1_losses]) for k in phase1_losses[0]}
-            num_phase1_samples = len(phase1_data["obs"]) if len(phase1_data["obs"]) > 0 else 0
-            print(f"Update {update}: Phase-1 loss: {avg_phase1_loss.get('grpo_loss', 0):.4f} (samples: {num_phase1_samples})")
+            # Convert all tensor values to scalars before averaging
+            phase1_losses_scalar = []
+            for d in phase1_losses:
+                scalar_dict = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in d.items()}
+                phase1_losses_scalar.append(scalar_dict)
+            
+            avg_phase1_loss = {k: np.mean([d[k] for d in phase1_losses_scalar]) for k in phase1_losses_scalar[0]}
+            print(f"Update {update}: Phase-1 loss: {avg_phase1_loss.get('grpo_loss', 0):.4f}")
             
             # Log to wandb
             if use_wandb:
@@ -927,7 +961,9 @@ def train(config: Config, use_wandb: bool = True):
                     "phase1/mean_advantage": avg_phase1_loss.get('mean_advantage', 0),
                     "phase1/mean_ratio": avg_phase1_loss.get('mean_ratio', 0),
                     "phase1/clip_fraction": avg_phase1_loss.get('clip_fraction', 0),
-                    "phase1/num_samples": num_phase1_samples,
+                    "phase1/reward_diversity_std": avg_phase1_loss.get('reward_diversity_std', 0),
+                    "phase1/reward_range": avg_phase1_loss.get('reward_range', 0),
+                    "phase1/relative_advantage_std": avg_phase1_loss.get('relative_advantage_std', 0),
                 }, step=update)
         
         # Log rollout statistics
