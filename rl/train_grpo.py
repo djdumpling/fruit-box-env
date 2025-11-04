@@ -38,12 +38,12 @@ class Config:
     # Data collection
     num_envs: int = 16  # Keep at 16 for maximum speedup (32 gives better GPU util but less speedup)
     rollout_steps: int = 128  # Reduced from 512 to 64 (8x reduction for ~6x speedup)
-    batch_size: int = 512  # Reduced from 1024 to 512 (2x smaller, still GPU-efficient, power of 2)
+    batch_size: int = 256  # Reduced from 1024 to 512 (2x smaller, still GPU-efficient, power of 2)
     epochs: int = 4
     
     # Phase-0 (PPO) hyperparameters
     phase0_lr: float = 1e-4
-    phase0_clip_eps: float = 0.15
+    phase0_clip_eps: float = 0.12
     phase0_target_kl: float = 0.015
     phase0_value_coef: float = 0.8
     
@@ -60,7 +60,7 @@ class Config:
     max_updates: int = 2500
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.04  # Increased from 0.02 to prevent over-confidence
+    entropy_coef: float = 0.02  # Increased from 0.02 to prevent over-confidence
     entropy_target: float = 0.4  # Target minimum entropy
     entropy_penalty_coef: float = 0.1  # Penalty coefficient for entropy floor
     grad_clip: float = 1.0
