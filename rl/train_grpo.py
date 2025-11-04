@@ -14,7 +14,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
-import math
 import random
 import numpy as np
 import torch
@@ -39,8 +38,8 @@ class Config:
     # Data collection
     num_envs: int = 16  # Keep at 16 for maximum speedup (32 gives better GPU util but less speedup)
     rollout_steps: int = 128  # Reduced from 512 to 64 (8x reduction for ~6x speedup)
-    batch_size: int = 256  # Reduced from 1024 to 512 (2x smaller, still GPU-efficient, power of 2)
-    epochs: int = 4
+    batch_size: int = 512  # Reduced from 1024 to 512 (2x smaller, still GPU-efficient, power of 2)
+    epochs: int = 3
     
     # Phase-0 (PPO) hyperparameters
     phase0_lr: float = 1e-4
@@ -49,28 +48,25 @@ class Config:
     phase0_value_coef: float = 0.8
     
     # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 5e-4
-    phase1_clip_eps: float = 0.28
+    phase1_lr: float = 1e-3
+    phase1_clip_eps: float = 0.3
     grpo_k: int = 16
     grpo_tau: float = 0.7  # For advantage smoothing/weighting
-    frozen_refresh_interval: int = 100  # Refresh frozen policy every N updates
+    frozen_refresh_interval: int = 75  # Refresh frozen policy every N updates
     grpo_temperature: float = 1.0  # Temperature for candidate sampling (higher = more diverse)
     min_reward_std: float = 0.01  # Minimum reward std for meaningful learning signal
     
     # Shared hyperparameters
-    max_updates: int = 2500
+    max_updates: int = 2000
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.02  # Increased from 0.02 to prevent over-confidence
-    entropy_target: float = 0.4  # Target minimum entropy
-    entropy_penalty_coef: float = 0.1  # Penalty coefficient for entropy floor
+    entropy_coef: float = 0.02
     grad_clip: float = 1.0
-    lr_warmup_steps: int = 50  # Learning rate warmup steps (recommended: 10-20)
+    lr_warmup_steps: int = 20  # Learning rate warmup steps (recommended: 10-20)
     
     # Curriculum learning
-    curriculum_updates: int = 500  # Extended to give more time to learn legal actions
-    illegal_penalty: float = -0.1  # Increased from -0.02 to improve legality rate
-    legal_action_bonus: float = 0.05  # Small bonus for selecting legal actions
+    curriculum_updates: int = 400  # Sigmoid annealing over 400 updates
+    illegal_penalty: float = -0.1
     
     # Other
     seed: int = 42
@@ -266,12 +262,10 @@ def visualize_action(
     print("=" * 70 + "\n")
 
 
-def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400, 
-             illegal_penalty: float = -0.05, legal_action_bonus: float = 0.0):
+def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
     """Create environment."""
     env = Sum10GymEnv(initial_grid=initial_grid)
-    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates,
-                         illegal_penalty=illegal_penalty, legal_action_bonus=legal_action_bonus)
+    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
     return env
 
 
@@ -284,7 +278,6 @@ def collect_rollouts(
     visualize: bool = False,
     render_env_idx: int = 0,
     current_update: Optional[int] = None,
-    recent_reward_diversity: float = 1.0,
 ):
     """Collect rollouts from environments."""
     if frozen_policy is None:
@@ -292,9 +285,6 @@ def collect_rollouts(
     
     # Track actions for visualization
     visualization_data = []
-    
-    # Track reward diversity for adaptive temperature
-    diversity_values = []
     
     # Initial observations
     obs_list = []
@@ -400,16 +390,9 @@ def collect_rollouts(
                     # Extract only valid logits
                     valid_logits = logits[0][:valid_action_count]
                     
-                    # Apply adaptive temperature based on recent reward diversity
-                    # If diversity is low, increase temperature to encourage exploration
-                    base_temperature = config.grpo_temperature
-                    if recent_reward_diversity < 0.1:
-                        adaptive_temp = base_temperature * 2.0  # Double temperature when diversity is low
-                    else:
-                        adaptive_temp = base_temperature
-                    
+                    # Apply temperature for diversity (higher temp = more exploration)
                     # Temperature scaling: logits / temperature
-                    scaled_logits = valid_logits / max(adaptive_temp, 1e-8)
+                    scaled_logits = valid_logits / max(config.grpo_temperature, 1e-8)
                     
                     dist_scaled = torch.distributions.Categorical(logits=scaled_logits)
                     candidates = dist_scaled.sample((config.grpo_k,))  # [K] - indices into compact valid space [0, valid_action_count)
@@ -432,7 +415,6 @@ def collect_rollouts(
                         candidates_original_indices[k].item(),
                         env,
                         illegal_penalty=config.illegal_penalty,
-                        legal_action_bonus=config.legal_action_bonus,
                     )
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
@@ -440,16 +422,6 @@ def collect_rollouts(
                 # Check reward diversity - critical for GRPO
                 reward_std = candidates_rewards.std().item()
                 reward_range = candidates_rewards.max().item() - candidates_rewards.min().item()
-                
-                # Track diversity for adaptive temperature
-                diversity_values.append(reward_std)
-                
-                # Reward diversity monitoring: warn when diversity is low
-                # Skip warning for early updates (update 0-100) as low diversity is expected with random policy
-                if reward_std < config.min_reward_std and current_update is not None and current_update > 100:
-                    if current_update % 50 == 0:  # Log periodically to avoid spam
-                        print(f"WARNING: Low reward diversity (std={reward_std:.4f}) at update {current_update}. "
-                              f"GRPO may be ineffective with low diversity.")
                 
                 # Enhanced debug logging for candidate rewards (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
@@ -594,60 +566,7 @@ def collect_rollouts(
                 obs_new, _ = envs[env_idx].reset()
                 obs[env_idx] = obs_new
     
-    # Compute average diversity for adaptive temperature
-    avg_diversity = sum(diversity_values) / len(diversity_values) if diversity_values else 1.0
-    
-    return visualization_data, avg_diversity
-
-
-def save_checkpoint_as_artifact(policy: nn.Module, checkpoint_name: str, update: int, use_wandb: bool = True, checkpoint_dir: str = "checkpoints"):
-    """Save policy checkpoint as a wandb artifact (or locally if wandb disabled).
-    
-    Args:
-        policy: Policy network to save
-        checkpoint_name: Name for the checkpoint (e.g., "policy_1000" or "policy_final")
-        update: Current update number
-        use_wandb: Whether wandb is enabled
-        checkpoint_dir: Local directory to save if wandb is disabled
-    """
-    import tempfile
-    import os
-    
-    # Save checkpoint to temporary file (or local file if wandb disabled)
-    if use_wandb:
-        # Save to temp file for artifact upload
-        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.pt') as tmp_file:
-            tmp_path = tmp_file.name
-            torch.save(policy.state_dict(), tmp_path)
-        
-        try:
-            # Create wandb artifact
-            artifact = wandb.Artifact(
-                name=checkpoint_name,
-                type="model",
-                metadata={
-                    "update": update,
-                    "checkpoint_name": checkpoint_name,
-                }
-            )
-            
-            # Add the checkpoint file to the artifact
-            artifact.add_file(tmp_path, name=f"{checkpoint_name}.pt")
-            
-            # Log the artifact
-            wandb.log_artifact(artifact)
-            print(f"Checkpoint saved as wandb artifact: {checkpoint_name} (update {update})")
-        
-        finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-    else:
-        # Fallback: save locally if wandb is disabled
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_name}.pt")
-        torch.save(policy.state_dict(), checkpoint_path)
-        print(f"Checkpoint saved locally (wandb disabled): {checkpoint_path}")
+    return visualization_data
 
 
 def train(config: Config, use_wandb: bool = True):
@@ -682,8 +601,6 @@ def train(config: Config, use_wandb: bool = True):
                 "phase1_lr": config.phase1_lr,
                 "phase1_clip_eps": config.phase1_clip_eps,
                 "entropy_coef": config.entropy_coef,
-                "entropy_target": config.entropy_target,
-                "entropy_penalty_coef": config.entropy_penalty_coef,
                 "epochs": config.epochs,
                 "grad_clip": config.grad_clip,
                 "grpo_k": config.grpo_k,
@@ -692,7 +609,6 @@ def train(config: Config, use_wandb: bool = True):
                 "frozen_refresh_interval": config.frozen_refresh_interval,
                 "curriculum_updates": config.curriculum_updates,
                 "illegal_penalty": config.illegal_penalty,
-                "legal_action_bonus": config.legal_action_bonus,
                 "batch_size": config.batch_size,
                 "lr_warmup_steps": config.lr_warmup_steps,
                 "min_reward_std": config.min_reward_std,
@@ -713,10 +629,10 @@ def train(config: Config, use_wandb: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Checkpoints will be saved as wandb artifacts (no local directory needed)
+    # Create directories
+    print("Creating directories...")
     import os
-    import tempfile
-    print("Checkpoints will be saved as wandb artifacts")
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
     
     # Create environments (create first, reset later to avoid segfault)
     print(f"Creating {config.num_envs} environments...")
@@ -724,8 +640,7 @@ def train(config: Config, use_wandb: bool = True):
     for i in range(config.num_envs):
         if (i + 1) % 10 == 0:
             print(f"  Created {i+1}/{config.num_envs} environments...")
-        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates,
-                      illegal_penalty=config.illegal_penalty, legal_action_bonus=config.legal_action_bonus)
+        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates)
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
@@ -743,17 +658,9 @@ def train(config: Config, use_wandb: bool = True):
     
     # Learning rate warmup helper function
     def get_lr_multiplier(step: int, warmup_steps: int) -> float:
-        """Get learning rate multiplier for warmup (cosine schedule).
-        
-        Uses cosine schedule for smooth transition from 0 to 1:
-        - At step 0: multiplier = 0
-        - At step warmup_steps: multiplier = 1
-        - Smooth cosine curve in between
-        """
+        """Get learning rate multiplier for warmup."""
         if step < warmup_steps:
-            # Cosine schedule: smooth transition from 0 to 1
-            # 0.5 * (1 - cos(π * x)) where x goes from 0 to 1
-            return 0.5 * (1 - math.cos(math.pi * step / max(warmup_steps, 1)))
+            return step / max(warmup_steps, 1)
         return 1.0
     
     # Create frozen policy for GRPO candidate sampling
@@ -770,8 +677,6 @@ def train(config: Config, use_wandb: bool = True):
     
     # Training loop
     global_step = 0
-    best_mean_reward = 0.0  # Track best reward for collapse detection
-    recent_reward_diversity = 1.0  # Track recent reward diversity for adaptive temperature
     for update in tqdm(range(config.max_updates), desc="Training"):
         # Learning rate warmup (recommended: 10-20 steps)
         lr_mult = get_lr_multiplier(update, config.lr_warmup_steps)
@@ -785,30 +690,21 @@ def train(config: Config, use_wandb: bool = True):
         for env in envs:
             env.set_curriculum_update(update)
         
-        # Refresh frozen policy periodically (condition-based to avoid capturing bad states)
+        # Refresh frozen policy periodically
         if update > 0 and update % config.frozen_refresh_interval == 0:
-            # Only refresh if performance is good (mean reward > 0.5)
-            # This prevents frozen policy from capturing collapsed states
-            if best_mean_reward > 0.5:
-                frozen_policy.load_state_dict(policy.state_dict())
-                frozen_policy.eval()
-                print(f"Frozen policy refreshed at update {update} (mean_reward={best_mean_reward:.4f})")
-            else:
-                print(f"Skipped frozen policy refresh at update {update} (mean_reward={best_mean_reward:.4f} < 0.5)")
+            frozen_policy.load_state_dict(policy.state_dict())
+            frozen_policy.eval()
+            print(f"Frozen policy refreshed at update {update}")
         
         # Collect rollouts
         visualize_this_update = (update % config.render_interval == 0)
-        visualization_data, avg_diversity = collect_rollouts(
+        visualization_data = collect_rollouts(
             envs, policy, buffer, config,
             frozen_policy=frozen_policy,
             visualize=visualize_this_update,
             render_env_idx=config.render_env_idx,
             current_update=update,
-            recent_reward_diversity=recent_reward_diversity,
         )
-        
-        # Update recent reward diversity for adaptive temperature
-        recent_reward_diversity = avg_diversity
         
         # Visualize actions if requested
         if visualize_this_update and visualization_data:
@@ -881,8 +777,6 @@ def train(config: Config, use_wandb: bool = True):
                     config.phase0_clip_eps,
                     config.phase0_value_coef,
                     config.entropy_coef,
-                    config.entropy_target,
-                    config.entropy_penalty_coef,
                 )
                 
                 # Check KL constraint (compute KL divergence)
@@ -1082,52 +976,19 @@ def train(config: Config, use_wandb: bool = True):
                 "rollout/total_moves": total_moves,
                 "rollout/legality_rate": valid_moves / max(total_moves, 1),
             }, step=update)
-            
-            # Collapse detection: trigger recovery if rewards drop >30% from peak
-            if update > 100:  # Need sufficient history
-                # Update best reward
-                if mean_reward > best_mean_reward:
-                    best_mean_reward = mean_reward
-                
-                # Check for collapse
-                if best_mean_reward > 0.1 and mean_reward < best_mean_reward * 0.7:
-                    print(f"\n{'='*70}")
-                    print(f"WARNING: Potential collapse detected at update {update}")
-                    print(f"Mean reward dropped from {best_mean_reward:.4f} to {mean_reward:.4f}")
-                    print(f"Triggering recovery: increasing entropy_coef and reducing learning rates")
-                    print(f"{'='*70}\n")
-                    
-                    # Recovery actions:
-                    # 1. Increase entropy coefficient to encourage exploration
-                    config.entropy_coef = min(0.15, config.entropy_coef * 1.5)
-                    
-                    # 2. Reduce learning rates to stabilize training
-                    for param_group in phase0_optimizer.param_groups:
-                        param_group['lr'] *= 0.5
-                    for param_group in phase1_optimizer.param_groups:
-                        param_group['lr'] *= 0.5
-                    
-                    # Log recovery actions
-                    wandb.log({
-                        "recovery/collapse_detected": 1.0,
-                        "recovery/new_entropy_coef": config.entropy_coef,
-                        "recovery/new_phase0_lr": phase0_optimizer.param_groups[0]['lr'],
-                        "recovery/new_phase1_lr": phase1_optimizer.param_groups[0]['lr'],
-                    }, step=update)
         
         # Clear buffer
         buffer.clear()
         global_step += config.rollout_steps * config.num_envs
         
-        # Checkpoint - save as wandb artifact
+        # Checkpoint
         if (update + 1) % config.checkpoint_interval == 0:
-            checkpoint_name = f"policy_{update+1}"
-            save_checkpoint_as_artifact(policy, checkpoint_name, update + 1, use_wandb, config.checkpoint_dir)
+            torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_{update+1}.pt")
     
-    # Save final checkpoint as wandb artifact
+    # Save final checkpoint
     print(f"\nSaving final checkpoint...")
-    save_checkpoint_as_artifact(policy, "policy_final", config.max_updates, use_wandb, config.checkpoint_dir)
-    print(f"Training complete! Final checkpoint saved as wandb artifact: policy_final")
+    torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_final.pt")
+    print(f"Training complete! Final checkpoint saved to {config.checkpoint_dir}/policy_final.pt")
     
     # Finalize wandb run
     if use_wandb:
@@ -1140,17 +1001,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint-dir", type=str, default=None, 
-                        help="Directory to save checkpoints (default: 'checkpoints')")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     args = parser.parse_args()
     
     config = Config(seed=args.seed)
-    if args.checkpoint_dir is not None:
-        config.checkpoint_dir = args.checkpoint_dir
     train(config, use_wandb=not args.no_wandb)
 
 
 if __name__ == "__main__":
     main()
-
