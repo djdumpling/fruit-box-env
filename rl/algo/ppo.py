@@ -66,7 +66,9 @@ def compute_ppo_loss(
     action_mask: torch.Tensor,
     clip_eps: float = 0.2,
     value_coef: float = 0.5,
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.01,
+    entropy_target: float = 0.0,
+    entropy_penalty_coef: float = 0.0
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute PPO clipped loss.
     
@@ -81,6 +83,8 @@ def compute_ppo_loss(
         clip_eps: PPO clipping epsilon
         value_coef: Value loss coefficient
         entropy_coef: Entropy bonus coefficient
+        entropy_target: Target minimum entropy (default: 0.0 = disabled)
+        entropy_penalty_coef: Penalty coefficient for entropy below target
     
     Returns:
         loss: Scalar loss tensor
@@ -119,8 +123,14 @@ def compute_ppo_loss(
     # Entropy bonus
     entropy_bonus = entropies.mean()
     
+    # Entropy floor penalty (to prevent over-confidence)
+    entropy_penalty = 0.0
+    if entropy_target > 0.0 and entropy_penalty_coef > 0.0:
+        entropy_shortfall = torch.clamp(entropy_target - entropy_bonus, min=0.0)
+        entropy_penalty = entropy_penalty_coef * entropy_shortfall
+    
     # Total loss
-    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
+    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus + entropy_penalty
     
     # Statistics
     info = {
@@ -128,6 +138,7 @@ def compute_ppo_loss(
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
         "entropy": entropy_bonus.item(),
+        "entropy_penalty": entropy_penalty.item() if isinstance(entropy_penalty, torch.Tensor) else entropy_penalty,
         "mean_advantage": advantages.mean().item(),
         "mean_ratio": ratio.mean().item(),
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),

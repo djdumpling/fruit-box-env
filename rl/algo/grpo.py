@@ -151,6 +151,7 @@ def simulate_action_reward(
     extent_idx: int,
     wrapper,
     illegal_penalty: float = -0.05,
+    legal_action_bonus: float = 0.0,
 ) -> float:
     """Simulate action and return immediate reward.
     
@@ -160,9 +161,10 @@ def simulate_action_reward(
         extent_idx: Flat index for extent (r2, c2) given anchor
         wrapper: TwoPhaseWrapper instance (for conversion functions)
         illegal_penalty: Penalty for illegal moves (default: -0.05)
+        legal_action_bonus: Bonus for legal moves (default: 0.0)
     
     Returns:
-        reward: Immediate reward from the action (penalty applied if illegal)
+        reward: Immediate reward from the action (penalty applied if illegal, bonus if legal)
     """
     # Clone environment state
     cloned_env = Sum10Env()
@@ -177,7 +179,7 @@ def simulate_action_reward(
     step_info = cloned_env.step(r1, c1, r2, c2)
     
     if step_info.valid:
-        return float(step_info.reward)
+        return float(step_info.reward) + legal_action_bonus
     else:
         # Apply penalty for illegal moves (consistent with actual execution)
         return illegal_penalty

@@ -20,11 +20,15 @@ class TwoPhaseWrapper(gym.Wrapper):
         env,
         curriculum_legal_only: bool = True,
         curriculum_updates: int = 200,
+        illegal_penalty: float = -0.05,
+        legal_action_bonus: float = 0.0,
     ):
         super().__init__(env)
         self.curriculum_legal_only = curriculum_legal_only
         self.curriculum_updates = curriculum_updates
         self.current_update = 0
+        self.illegal_penalty = illegal_penalty
+        self.legal_action_bonus = legal_action_bonus
         
         # Phase state: 0 = selecting anchor, 1 = selecting extent
         self.phase = 0
@@ -216,11 +220,15 @@ class TwoPhaseWrapper(gym.Wrapper):
             multi_action = np.array([r1, c1, r2, c2], dtype=np.int32)
             obs, reward, terminated, truncated, info = self.env.step(multi_action)
             
-            # Apply curriculum penalty if needed
-            if self.current_update >= self.curriculum_updates:
-                # Check if move was illegal (sum != 10)
-                if not info.get("valid", True):
-                    reward += -0.05  # penalty for illegal rectangle
+            # Apply rewards/penalties based on action legality
+            is_valid = info.get("valid", True)
+            if is_valid:
+                # Add bonus for legal actions
+                reward += self.legal_action_bonus
+            else:
+                # Apply penalty for illegal actions (after curriculum phase)
+                if self.current_update >= self.curriculum_updates:
+                    reward += self.illegal_penalty
             
             # Reset phase state
             self.phase = 0
