@@ -57,7 +57,7 @@ class Config:
     min_reward_std: float = 0.01  # Minimum reward std for meaningful learning signal
     
     # Shared hyperparameters
-    max_updates: int = 5
+    max_updates: int = 2500
     gamma: float = 0.995
     gae_lambda: float = 0.95
     entropy_coef: float = 0.05  # Increased from 0.02 to prevent over-confidence
