@@ -60,26 +60,26 @@ class Config:
     max_updates: int = 2500
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.05  # Increased from 0.02 to prevent over-confidence
-    entropy_target: float = 0.5  # Target minimum entropy
+    entropy_coef: float = 0.04  # Increased from 0.02 to prevent over-confidence
+    entropy_target: float = 0.4  # Target minimum entropy
     entropy_penalty_coef: float = 0.1  # Penalty coefficient for entropy floor
     grad_clip: float = 1.0
     lr_warmup_steps: int = 20  # Learning rate warmup steps (recommended: 10-20)
     
     # Curriculum learning
-    curriculum_updates: int = 750  # Extended to give more time to learn legal actions
+    curriculum_updates: int = 400  # Extended to give more time to learn legal actions
     illegal_penalty: float = -0.1  # Increased from -0.02 to improve legality rate
-    legal_action_bonus: float = 0.01  # Small bonus for selecting legal actions
+    legal_action_bonus: float = 0.05  # Small bonus for selecting legal actions
     
     # Behavior cloning (BC-KL annealing from 0.01 to 0)
     bc_kl_coef_start: float = 0.01
     bc_kl_coef_end: float = 0.0
-    bc_kl_anneal_updates: int = 750  # Anneal over same period as curriculum
+    bc_kl_anneal_updates: int = 400  # Anneal over same period as curriculum
     
     # Other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 500
     render_interval: int = 5
     render_env_idx: int = 0
 
