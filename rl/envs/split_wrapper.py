@@ -115,11 +115,11 @@ class TwoPhaseWrapper(gym.Wrapper):
                 import math
                 x = self.current_update
                 x0 = self.curriculum_updates / 2.0
-                k = 10.0 / self.curriculum_updates  # Steepness parameter
+                k = 6.0 / self.curriculum_updates  # Steepness parameter
                 illegal_exposure = 1.0 / (1.0 + math.exp(-k * (x - x0)))
                 
                 # Start with only legal actions, gradually allow illegal actions
-                if illegal_exposure < 0.01:
+                if illegal_exposure < 0.05:
                     # Strict phase: only legal actions
                     mask = mask & legal_mask
                 else:

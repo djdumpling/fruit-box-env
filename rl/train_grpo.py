@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+import math
 import random
 import numpy as np
 import torch
@@ -64,17 +65,12 @@ class Config:
     entropy_target: float = 0.4  # Target minimum entropy
     entropy_penalty_coef: float = 0.1  # Penalty coefficient for entropy floor
     grad_clip: float = 1.0
-    lr_warmup_steps: int = 20  # Learning rate warmup steps (recommended: 10-20)
+    lr_warmup_steps: int = 50  # Learning rate warmup steps (recommended: 10-20)
     
     # Curriculum learning
-    curriculum_updates: int = 400  # Extended to give more time to learn legal actions
+    curriculum_updates: int = 500  # Extended to give more time to learn legal actions
     illegal_penalty: float = -0.1  # Increased from -0.02 to improve legality rate
     legal_action_bonus: float = 0.05  # Small bonus for selecting legal actions
-    
-    # Behavior cloning (BC-KL annealing from 0.01 to 0)
-    bc_kl_coef_start: float = 0.01
-    bc_kl_coef_end: float = 0.0
-    bc_kl_anneal_updates: int = 400  # Anneal over same period as curriculum
     
     # Other
     seed: int = 42
@@ -697,7 +693,6 @@ def train(config: Config, use_wandb: bool = True):
                 "curriculum_updates": config.curriculum_updates,
                 "illegal_penalty": config.illegal_penalty,
                 "legal_action_bonus": config.legal_action_bonus,
-                "bc_kl_anneal_updates": config.bc_kl_anneal_updates,
                 "batch_size": config.batch_size,
                 "lr_warmup_steps": config.lr_warmup_steps,
                 "min_reward_std": config.min_reward_std,
@@ -748,9 +743,17 @@ def train(config: Config, use_wandb: bool = True):
     
     # Learning rate warmup helper function
     def get_lr_multiplier(step: int, warmup_steps: int) -> float:
-        """Get learning rate multiplier for warmup."""
+        """Get learning rate multiplier for warmup (cosine schedule).
+        
+        Uses cosine schedule for smooth transition from 0 to 1:
+        - At step 0: multiplier = 0
+        - At step warmup_steps: multiplier = 1
+        - Smooth cosine curve in between
+        """
         if step < warmup_steps:
-            return step / max(warmup_steps, 1)
+            # Cosine schedule: smooth transition from 0 to 1
+            # 0.5 * (1 - cos(π * x)) where x goes from 0 to 1
+            return 0.5 * (1 - math.cos(math.pi * step / max(warmup_steps, 1)))
         return 1.0
     
     # Create frozen policy for GRPO candidate sampling
