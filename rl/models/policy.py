@@ -24,17 +24,17 @@ class CNNPolicy(nn.Module):
         self.obs_shape = obs_shape
         self.action_dim = action_dim
         
-        # Convolutional layers
-        # Input: (4, 10, 17)
-        # Conv1: 3x3, no padding → (32, 8, 15)
+        # convolutional layers
+        # input: (4, 10, 17)
+        # conv1: 3x3, no padding → (32, 8, 15)
         self.conv1 = nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=0)
-        # Conv2: 3x3, padding=1 → (64, 8, 15) (maintains spatial size)
+        # conv2: 3x3, padding=1 → (64, 8, 15) (maintains spatial size)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         
-        # Flattened size: 64 * 8 * 15 = 7680
+        # flattened size: 64 * 8 * 15 = 7680
         self.flattened_size = 64 * 8 * 15
         
-        # Feature extractor
+        # feature extractor
         self.feature_extractor = nn.Sequential(
             self.conv1,
             nn.ReLU(),
@@ -42,13 +42,13 @@ class CNNPolicy(nn.Module):
             nn.ReLU(),
         )
         
-        # Fully connected layers
+        # fully connected layers
         self.fc = nn.Linear(self.flattened_size, 256)
         
-        # Policy head
+        # policy head
         self.policy_head = nn.Linear(256, action_dim)
         
-        # Value head
+        # value head
         self.value_head = nn.Linear(256, 1)
     
     def forward(
@@ -66,20 +66,20 @@ class CNNPolicy(nn.Module):
             logits: [batch_size, action_dim] policy logits
             value: [batch_size, 1] value estimate
         """
-        # Extract features
+        # extract features
         x = self.feature_extractor(obs)  # [batch, 64, 8, 15]
         x = x.view(x.size(0), -1)  # [batch, 7680]
         x = F.relu(self.fc(x))  # [batch, 256]
         
-        # Policy logits
+        # policy logits
         logits = self.policy_head(x)  # [batch, action_dim]
         
-        # Apply action mask
+        # apply action mask
         if action_mask is not None:
-            # Set invalid actions to very negative value
+            # set invalid actions to very negative value
             logits = logits.masked_fill(~action_mask, -1e9)
         
-        # Value estimate
+        # value estimate
         value = self.value_head(x)  # [batch, 1]
         
         return logits, value

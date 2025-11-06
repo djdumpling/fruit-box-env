@@ -10,7 +10,7 @@ python rl/eval.py \
 
 import sys
 from pathlib import Path
-# Add parent directory to path for imports
+# add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
@@ -36,9 +36,9 @@ from fruit_box import Sum10Env
 class Config:
     """Training configuration."""
     # Data collection
-    num_envs: int = 16  # Keep at 16 for maximum speedup (32 gives better GPU util but less speedup)
-    rollout_steps: int = 128  # Reduced from 512 to 64 (8x reduction for ~6x speedup)
-    batch_size: int = 512  # Reduced from 1024 to 512 (2x smaller, still GPU-efficient, power of 2)
+    num_envs: int = 16
+    rollout_steps: int = 128
+    batch_size: int = 512
     epochs: int = 3
     
     # Phase-0 (PPO) hyperparameters
@@ -51,10 +51,10 @@ class Config:
     phase1_lr: float = 1e-3
     phase1_clip_eps: float = 0.3
     grpo_k: int = 16
-    grpo_tau: float = 0.7  # For advantage smoothing/weighting
-    frozen_refresh_interval: int = 75  # Refresh frozen policy every N updates
-    grpo_temperature: float = 1.0  # Temperature for candidate sampling (higher = more diverse)
-    min_reward_std: float = 0.01  # Minimum reward std for meaningful learning signal
+    grpo_tau: float = 0.7
+    frozen_refresh_interval: int = 75 
+    grpo_temperature: float = 1.0
+    min_reward_std: float = 0.01
     
     # Shared hyperparameters
     max_updates: int = 2500
@@ -62,10 +62,10 @@ class Config:
     gae_lambda: float = 0.95
     entropy_coef: float = 0.02
     grad_clip: float = 1.0
-    lr_warmup_steps: int = 20  # Learning rate warmup steps (recommended: 10-20)
+    lr_warmup_steps: int = 20
     
     # Curriculum learning
-    curriculum_updates: int = 400  # Sigmoid annealing over 400 updates
+    curriculum_updates: int = 400
     illegal_penalty: float = -0.1
     
     # Other
@@ -92,16 +92,16 @@ class RolloutBuffer:
         self.phase0_rewards = []
         self.phase0_dones = []
         self.phase0_masks = []
-        self.phase0_env_indices = []  # Track which env each transition belongs to
+        self.phase0_env_indices = []  # track which env each transition belongs to
         
         # Phase-1 data (extent selection)
         self.phase1_obs = []
         self.phase1_anchors = []
-        self.phase1_actions = []  # List of [K] arrays
-        self.phase1_logprobs = []  # List of [K] arrays
-        self.phase1_rewards = []  # List of [K] arrays
+        self.phase1_actions = []  # list of [K] arrays
+        self.phase1_logprobs = []  # list of [K] arrays
+        self.phase1_rewards = []  # list of [K] arrays
         self.phase1_masks = []
-        self.phase1_executed_actions = []  # Actually executed action
+        self.phase1_executed_actions = []  # actually executed action
         self.phase1_executed_logprobs = []
         self.phase1_executed_rewards = []
         self.phase1_dones = []
@@ -116,14 +116,14 @@ class RolloutBuffer:
         env_idx: int,
     ):
         """Add Phase-0 transition."""
-        # Detach to avoid double backward
+        # detach to avoid double backward
         self.phase0_obs.append(obs.detach().cpu())
         self.phase0_actions.append(action.detach().cpu())
         self.phase0_logprobs.append(logprob.detach().cpu())
         self.phase0_values.append(value.detach().cpu())
         self.phase0_masks.append(mask.detach().cpu())
         self.phase0_env_indices.append(env_idx)
-        # Initialize reward and done (will be updated when Phase-1 completes)
+        # initialize reward and done (will be updated when Phase-1 completes)
         self.phase0_rewards.append(torch.tensor([0.0], device='cpu'))
         self.phase0_dones.append(torch.tensor([False], device='cpu', dtype=torch.bool))
     
@@ -141,7 +141,7 @@ class RolloutBuffer:
         done: bool,
     ):
         """Add Phase-1 transition."""
-        # Detach to avoid double backward
+        # detach to avoid double backward
         self.phase1_obs.append(obs.detach().cpu())
         self.phase1_anchors.append(anchor.detach().cpu())
         self.phase1_actions.append(candidates_actions.detach().cpu())
@@ -157,7 +157,7 @@ class RolloutBuffer:
     def get_phase0_data(self) -> Dict[str, torch.Tensor]:
         """Get Phase-0 data as tensors."""
         return {
-            "obs": torch.stack(self.phase0_obs, dim=0).to(self.device),  # [rollout_steps, num_envs, ...]
+            "obs": torch.stack(self.phase0_obs, dim=0).to(self.device),
             "actions": torch.stack(self.phase0_actions, dim=0).to(self.device),
             "logprobs": torch.stack(self.phase0_logprobs, dim=0).to(self.device),
             "values": torch.stack(self.phase0_values, dim=0).to(self.device),
@@ -168,14 +168,14 @@ class RolloutBuffer:
     
     def get_phase1_data(self) -> Dict:
         """Get Phase-1 data."""
-        # Phase-1 data has variable K and variable mask sizes, so we'll handle it specially
-        # Pad masks to max size (170) for consistent stacking
+        # phase-1 data has variable K and variable mask sizes, so we'll handle it specially
+        # pad masks to max size (170) for consistent stacking
         max_mask_size = 170
         padded_masks = []
         for mask in self.phase1_masks:
             mask_size = mask.shape[-1]
             if mask_size < max_mask_size:
-                # Pad with False (invalid actions)
+                # pad with False (invalid actions)
                 padding = torch.zeros(mask.shape[:-1] + (max_mask_size - mask_size,), dtype=torch.bool)
                 padded_mask = torch.cat([mask, padding], dim=-1)
             else:
@@ -185,7 +185,7 @@ class RolloutBuffer:
         return {
             "obs": torch.stack(self.phase1_obs, dim=0).to(self.device),
             "anchors": torch.stack(self.phase1_anchors, dim=0).to(self.device),
-            "candidates_actions": self.phase1_actions,  # List of tensors
+            "candidates_actions": self.phase1_actions,  # list of tensors
             "candidates_logprobs": self.phase1_logprobs,
             "candidates_rewards": self.phase1_rewards,
             "executed_actions": torch.stack(self.phase1_executed_actions, dim=0).to(self.device),
@@ -283,18 +283,18 @@ def collect_rollouts(
     if frozen_policy is None:
         frozen_policy = policy
     
-    # Track actions for visualization
+    # track actions for visualization
     visualization_data = []
     
-    # Initial observations
+    # initial observations
     obs_list = []
     for env in envs:
         obs, _ = env.reset()
         obs_list.append(obs)
-    obs = torch.stack(obs_list, dim=0).to(next(policy.parameters()).device)  # [num_envs, 4, 10, 17]
+    obs = torch.stack(obs_list, dim=0).to(next(policy.parameters()).device)
     
     for step in range(config.rollout_steps):
-        # Get action masks and phases
+        # get action masks and phases
         masks_list = []
         phases = []
         for env in envs:
@@ -302,21 +302,21 @@ def collect_rollouts(
             masks_list.append(mask)
             phases.append(env.phase)
         
-        # Separate Phase-0 and Phase-1 envs
+        # separate Phase-0 and Phase-1 envs
         phase0_indices = [i for i, p in enumerate(phases) if p == 0]
         phase1_indices = [i for i, p in enumerate(phases) if p == 1]
         phase0_mask = torch.tensor([i in phase0_indices for i in range(len(envs))], device=obs.device)
         phase1_mask = ~phase0_mask
         
-        # Phase-0: select anchor
+        # phase-0: select anchor
         if phase0_mask.any():
             phase0_obs = obs[phase0_mask]
             phase0_masks = torch.stack([masks_list[i] for i in phase0_indices], dim=0).to(obs.device)
-            phase0_actions, phase0_logprobs, phase0_values = policy.get_action_and_value(
+            phase0_actions, phase0_logprobs,                 phase0_values = policy.get_action_and_value(
                 phase0_obs, phase0_masks
             )
             
-            # Store Phase-0 data
+            # store Phase-0 data
             for i, env_idx in enumerate(phase0_indices):
                 buffer.add_phase0(
                     obs[env_idx:env_idx+1],
@@ -327,13 +327,13 @@ def collect_rollouts(
                     env_idx,
                 )
         
-        # Phase-1: select extent with GRPO
+        # phase-1: select extent with GRPO
         if phase1_mask.any():
             phase1_obs = obs[phase1_mask]
             phase1_masks_list = [masks_list[i] for i in phase1_indices]
             phase1_env_indices = phase1_indices
             
-            # Get anchors for Phase-1 envs
+            # get anchors for Phase-1 envs
             phase1_anchors = []
             for env_idx in phase1_env_indices:
                 env = envs[env_idx]
@@ -341,7 +341,7 @@ def collect_rollouts(
                 phase1_anchors.append(anchor_idx)
             phase1_anchors = torch.tensor(phase1_anchors, device=obs.device)
             
-            # Sample K candidates from frozen policy
+            # sample K candidates from frozen policy
             all_candidates_actions = []
             all_candidates_logprobs = []
             all_candidates_rewards = []
@@ -350,13 +350,13 @@ def collect_rollouts(
                 env = envs[env_idx]
                 anchor_idx = phase1_anchors[i].item()
                 
-                # Get valid action mask for this env
+                # get valid action mask for this env
                 valid_mask = phase1_masks_list[i]
                 valid_action_count = valid_mask.sum().item()
                 
-                # Enhanced debug logging for Phase-1 (log every 50 updates)
+                # enhanced debug logging for Phase-1 (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
-                    # Count legal actions if curriculum is active
+                    # count legal actions if curriculum is active
                     legal_count = valid_action_count
                     if env.curriculum_legal_only and env.current_update < env.curriculum_updates * 2:
                         legal_mask = env.get_legal_only_mask()
@@ -367,48 +367,47 @@ def collect_rollouts(
                         "debug/phase1_legal_count": legal_count,
                     }, commit=False)
                 
-                # Skip if no valid actions (shouldn't happen in normal flow, but handle gracefully)
+                # skip if no valid actions (shouldn't happen in normal flow, but handle gracefully)
                 if valid_action_count == 0:
-                    # Use dummy values - this shouldn't happen if curriculum/constraints work correctly
+                    # use dummy values - this shouldn't happen if curriculum/constraints work correctly
                     all_candidates_actions.append(torch.zeros(config.grpo_k, dtype=torch.long, device=obs.device))
                     all_candidates_logprobs.append(torch.zeros(config.grpo_k, device=obs.device))
                     all_candidates_rewards.append(torch.zeros(config.grpo_k, device=obs.device))
                     continue
                 
-                # Sample K candidates
-                # For Phase-1, we need to create a full-size mask (170) with only valid positions
+                # sample K candidates
+                # for Phase-1, we need to create a full-size mask (170) with only valid positions
                 # Phase-1 action space is variable, so we pad the mask
                 full_mask = torch.zeros(170, dtype=torch.bool, device=obs.device)
-                # Extract only the True values from valid_mask and place them at the start
-                # Find indices where valid_mask is True
+                # extract only the True values from valid_mask and place them at the start
+                # find indices where valid_mask is True
                 valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).to(obs.device)
-                # Place them at the beginning of full_mask
+                # place them at the beginning of full_mask
                 full_mask[:valid_action_count] = True
                 
                 with torch.no_grad():
                     logits, _ = frozen_policy(phase1_obs[i:i+1], full_mask.unsqueeze(0))
-                    # Extract only valid logits
+                    # extract only valid logits
                     valid_logits = logits[0][:valid_action_count]
                     
-                    # Apply temperature for diversity (higher temp = more exploration)
-                    # Temperature scaling: logits / temperature
+                    # apply temperature for diversity (higher temp = more exploration)
                     scaled_logits = valid_logits / max(config.grpo_temperature, 1e-8)
                     
                     dist_scaled = torch.distributions.Categorical(logits=scaled_logits)
-                    candidates = dist_scaled.sample((config.grpo_k,))  # [K] - indices into compact valid space [0, valid_action_count)
+                    candidates = dist_scaled.sample((config.grpo_k,))
                     
-                    # Compute logprobs with original (unscaled) logits for correct probability
+                    # compute logprobs with original (unscaled) logits for correct probability
                     dist_original = torch.distributions.Categorical(logits=valid_logits)
-                    candidates_logprobs = dist_original.log_prob(candidates)  # [K]
+                    candidates_logprobs = dist_original.log_prob(candidates)
                 
-                # Convert candidate indices back to original mask indices
+                # convert candidate indices back to original mask indices
                 # candidates are indices [0, valid_action_count), need to map to actual valid_indices
-                candidates_original_indices = valid_indices[candidates]  # Map to original indices
+                candidates_original_indices = valid_indices[candidates]
                 
-                # Simulate each candidate to get rewards
+                # simulate each candidate to get rewards
                 candidates_rewards = []
                 for k in range(config.grpo_k):
-                    # Use the original index from the valid_mask
+                    # use the original index from the valid_mask
                     reward = simulate_action_reward(
                         env.game_env,
                         anchor_idx,
@@ -419,13 +418,13 @@ def collect_rollouts(
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
                 
-                # Check reward diversity - critical for GRPO
+                # check reward diversity - critical for GRPO
                 reward_std = candidates_rewards.std().item()
                 reward_range = candidates_rewards.max().item() - candidates_rewards.min().item()
                 
-                # Enhanced debug logging for candidate rewards (log every 50 updates)
+                # enhanced debug logging for candidate rewards (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
-                    # Compute relative advantages for diversity metric
+                    # compute relative advantages for diversity metric
                     mean_reward = candidates_rewards.mean().item()
                     rel_advantages = candidates_rewards - mean_reward
                     rel_adv_std = rel_advantages.std().item()
@@ -434,32 +433,25 @@ def collect_rollouts(
                         "debug/phase1_candidate_rewards_mean": candidates_rewards.mean().item(),
                         "debug/phase1_candidate_rewards_std": reward_std,
                         "debug/phase1_candidate_rewards_range": reward_range,
-                        "debug/phase1_reward_diversity": rel_adv_std,  # Key metric: std of relative advantages
+                        "debug/phase1_reward_diversity": rel_adv_std,
                         "debug/phase1_candidate_rewards_min": candidates_rewards.min().item(),
                         "debug/phase1_candidate_rewards_max": candidates_rewards.max().item(),
                         "debug/phase1_num_legal_candidates": (candidates_rewards > 0).sum().item(),
                         "debug/phase1_num_penalized_candidates": (candidates_rewards == config.illegal_penalty).sum().item(),
                     }, commit=False)
                 
-                # Note: Low reward diversity is expected for this task (most legal moves clear 2 cells, some 3, rarely 4)
-                # This means GRPO relative advantages will be small, but that's inherent to the reward structure
-                # The warning is disabled since this is expected behavior, not a bug
-                # if reward_std < config.min_reward_std and current_update is not None and current_update % 100 == 0:
-                #     print(f"Info: Low reward diversity (std={reward_std:.4f}, range={reward_range:.2f}) at update {current_update}. "
-                #           f"This is expected - most legal moves clear 2 cells, so relative advantages will be small.")
-                
-                # Store candidates with original indices for consistency
+                # store candidates with original indices for consistency
                 all_candidates_actions.append(candidates_original_indices)
                 all_candidates_logprobs.append(candidates_logprobs)
                 all_candidates_rewards.append(candidates_rewards)
             
-            # Execute best candidate (or sample from policy)
+            # execute best candidate (or sample from policy)
             executed_actions = []
             executed_logprobs = []
             executed_rewards = []
             
             for i, env_idx in enumerate(phase1_env_indices):
-                # Use best candidate (highest reward)
+                # use best candidate (highest reward)
                 best_idx = torch.argmax(all_candidates_rewards[i])
                 executed_action = all_candidates_actions[i][best_idx]
                 executed_logprob = all_candidates_logprobs[i][best_idx]
@@ -469,7 +461,7 @@ def collect_rollouts(
                 executed_logprobs.append(executed_logprob.unsqueeze(0))
                 executed_rewards.append(executed_reward)
             
-            # Store Phase-1 data
+            # store Phase-1 data
             for i, env_idx in enumerate(phase1_env_indices):
                 buffer.add_phase1(
                     obs[env_idx:env_idx+1],
@@ -484,7 +476,7 @@ def collect_rollouts(
                     False,  # done will be updated after step
                 )
         
-        # Step environments
+        # step environments
         new_obs_list = []
         rewards_list = []
         dones_list = []
@@ -504,18 +496,18 @@ def collect_rollouts(
         
         for env_idx, env in enumerate(envs):
             if env_idx in phase0_action_map:
-                # Phase-0: step with anchor action
+                # phase-0: step with anchor action
                 action_idx = phase0_action_map[env_idx]
                 obs_new, reward, terminated, truncated, info = env.step(action_idx)
                 new_obs_list.append(obs_new)
-                rewards_list.append(0.0)  # No reward in Phase-0
+                rewards_list.append(0.0)  # no reward in Phase-0
                 dones_list.append(False)
                 phase0_reward_indices.append(env_idx)
             elif env_idx in phase1_action_map:
-                # Phase-1: step with executed extent action
+                # phase-1: step with executed extent action
                 action_idx = phase1_action_map[env_idx]
                 
-                # Get rectangle coordinates for visualization before step
+                # get rectangle coordinates for visualization before step
                 if visualize and env_idx == render_env_idx:
                     r1, c1 = env.selected_anchor
                     r2, c2 = env.flat_idx_to_extent(r1, c1, action_idx)
@@ -524,7 +516,7 @@ def collect_rollouts(
                 
                 obs_new, reward, terminated, truncated, info = env.step(action_idx)
                 
-                # Store visualization data after step (only for valid moves with reward > 0)
+                # store visualization data after step (only for valid moves with reward > 0)
                 if visualize and env_idx == render_env_idx and reward > 0:
                     visualization_data.append((
                         reward,
@@ -537,7 +529,7 @@ def collect_rollouts(
                 rewards_list.append(reward)
                 dones_list.append(terminated or truncated)
             else:
-                # Should not happen
+                # should not happen
                 obs_new, reward, terminated, truncated, info = env.reset()
                 new_obs_list.append(obs_new)
                 rewards_list.append(0.0)
@@ -547,20 +539,20 @@ def collect_rollouts(
         rewards = torch.tensor(rewards_list, device=obs.device, dtype=torch.float32)
         dones = torch.tensor(dones_list, device=obs.device, dtype=torch.bool)
         
-        # Update rewards for Phase-1 completions
+        # update rewards for Phase-1 completions
         # Phase-1 rewards go to the corresponding Phase-0 transition
         if phase1_mask.any():
             phase1_indices = torch.where(phase1_mask)[0]
             for i, env_idx in enumerate(phase1_indices):
-                # Find the most recent Phase-0 transition for this env
+                # find the most recent Phase-0 transition for this env
                 for j in range(len(buffer.phase0_env_indices) - 1, -1, -1):
                     if buffer.phase0_env_indices[j] == env_idx.item():
-                        # Assign Phase-1 reward to this Phase-0 transition
+                        # assign Phase-1 reward to this Phase-0 transition
                         buffer.phase0_rewards[j] = torch.tensor([rewards[env_idx].item()], device='cpu')
                         buffer.phase0_dones[j] = torch.tensor([dones[env_idx].item()], device='cpu', dtype=torch.bool)
                         break
         
-        # Reset done environments
+        # reset done environments
         for env_idx, done in enumerate(dones):
             if done:
                 obs_new, _ = envs[env_idx].reset()
@@ -578,9 +570,9 @@ def train(config: Config, use_wandb: bool = True):
     """
     print("Starting training setup...")
     
-    # Initialize wandb
+    # initialize wandb
     if use_wandb:
-        # Set wandb to use a temp directory to avoid cluttering repo
+        # set wandb to use a temp directory to avoid cluttering repo
         import os
         import tempfile
         os.environ["WANDB_DIR"] = tempfile.gettempdir()
@@ -618,23 +610,23 @@ def train(config: Config, use_wandb: bool = True):
         )
         print("Wandb initialized!")
     
-    # Set seeds
+    # set seeds
     print("Setting seeds...")
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     
-    # Setup
+    # setup
     print("Creating device...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Create directories
+    # create directories
     print("Creating directories...")
     import os
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     
-    # Create environments (create first, reset later to avoid segfault)
+    # create environments (create first, reset later to avoid segfault)
     print(f"Creating {config.num_envs} environments...")
     envs = []
     for i in range(config.num_envs):
@@ -644,41 +636,41 @@ def train(config: Config, use_wandb: bool = True):
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
-    # Create policy
+    # create policy
     print("Creating policy...")
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     print("Policy created")
     
-    # Create separate optimizers for Phase-0 and Phase-1
-    # Learning rates will be warmed up during training
+    # create separate optimizers for Phase-0 and Phase-1
+    # learning rates will be warmed up during training
     print("Creating optimizers...")
     phase0_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase0_lr)
     phase1_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase1_lr)
     print("Optimizers created")
     
-    # Learning rate warmup helper function
+    # learning rate warmup helper function
     def get_lr_multiplier(step: int, warmup_steps: int) -> float:
         """Get learning rate multiplier for warmup."""
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         return 1.0
     
-    # Create frozen policy for GRPO candidate sampling
+    # create frozen policy for GRPO candidate sampling
     frozen_policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     frozen_policy.load_state_dict(policy.state_dict())
     frozen_policy.eval()
     print("Frozen policy created")
     
-    # Create buffer
+    # create buffer
     print("Creating buffer...")
     buffer = RolloutBuffer(config.rollout_steps, config.num_envs, (4, 10, 17), device)
     print("Buffer created")
     
     
-    # Training loop
+    # training loop
     global_step = 0
     for update in tqdm(range(config.max_updates), desc="Training"):
-        # Learning rate warmup (recommended: 10-20 steps)
+        # learning rate warmup (recommended: 10-20 steps)
         lr_mult = get_lr_multiplier(update, config.lr_warmup_steps)
         if lr_mult < 1.0:
             for param_group in phase0_optimizer.param_groups:
@@ -686,17 +678,17 @@ def train(config: Config, use_wandb: bool = True):
             for param_group in phase1_optimizer.param_groups:
                 param_group['lr'] = config.phase1_lr * lr_mult
         
-        # Update curriculum
+        # update curriculum
         for env in envs:
             env.set_curriculum_update(update)
         
-        # Refresh frozen policy periodically
+        # refresh frozen policy periodically
         if update > 0 and update % config.frozen_refresh_interval == 0:
             frozen_policy.load_state_dict(policy.state_dict())
             frozen_policy.eval()
             print(f"Frozen policy refreshed at update {update}")
         
-        # Collect rollouts
+        # collect rollouts
         visualize_this_update = (update % config.render_interval == 0)
         visualization_data = collect_rollouts(
             envs, policy, buffer, config,
@@ -706,7 +698,7 @@ def train(config: Config, use_wandb: bool = True):
             current_update=update,
         )
         
-        # Visualize actions if requested
+        # visualize actions if requested
         if visualize_this_update and visualization_data:
             print(f"\n{'='*70}")
             print(f"VISUALIZATION - Update {update}")
@@ -716,22 +708,22 @@ def train(config: Config, use_wandb: bool = True):
                 total_reward += reward
                 visualize_action(grid, r1, c1, r2, c2, turn, reward, total_reward)
         
-        # Get data
+        # get data
         phase0_data = buffer.get_phase0_data()
         phase1_data = buffer.get_phase1_data()
         
-        # Compute advantages for Phase-0
+        # compute advantages for Phase-0
         phase0_advantages, phase0_returns = compute_gae(
-            phase0_data["rewards"].transpose(0, 1),  # [num_envs, rollout_steps]
+            phase0_data["rewards"].transpose(0, 1),
             phase0_data["values"].transpose(0, 1),
             phase0_data["dones"].transpose(0, 1),
             config.gamma,
             config.gae_lambda,
         )
-        phase0_advantages = phase0_advantages.transpose(0, 1)  # [rollout_steps, num_envs]
+        phase0_advantages = phase0_advantages.transpose(0, 1)
         phase0_returns = phase0_returns.transpose(0, 1)
         
-        # Flatten for training
+        # flatten for training
         phase0_obs_flat = phase0_data["obs"].reshape(-1, *phase0_data["obs"].shape[2:])
         phase0_actions_flat = phase0_data["actions"].reshape(-1)
         phase0_logprobs_flat = phase0_data["logprobs"].reshape(-1)
@@ -739,20 +731,20 @@ def train(config: Config, use_wandb: bool = True):
         phase0_returns_flat = phase0_returns.reshape(-1)
         phase0_masks_flat = phase0_data["masks"].reshape(-1, phase0_data["masks"].shape[-1])
         
-        # Normalize returns
+        # normalize returns
         phase0_returns_flat = (phase0_returns_flat - phase0_returns_flat.mean()) / (
             phase0_returns_flat.std() + 1e-8
         )
         
-        # Scale advantages so std(A) ≈ 1
+        # scale advantages so std(A) ≈ 1
         adv_std = phase0_advantages_flat.std()
         if adv_std > 1e-8:
             phase0_advantages_flat = phase0_advantages_flat / adv_std
         
-        # Update Phase-0 (PPO)
+        # update Phase-0 (PPO)
         phase0_losses = []
         for epoch in range(config.epochs):
-            # Shuffle
+            # shuffle
             indices = torch.randperm(len(phase0_obs_flat), device=device)
             
             for start in range(0, len(phase0_obs_flat), config.batch_size):
@@ -779,8 +771,8 @@ def train(config: Config, use_wandb: bool = True):
                     config.entropy_coef,
                 )
                 
-                # Check KL constraint (compute KL divergence)
-                # We need to compute new logprobs to check KL
+                # check KL constraint (compute KL divergence)
+                # we need to compute new logprobs to check KL
                 with torch.no_grad():
                     logits, _ = policy(batch_obs, batch_masks)
                     new_logprobs_batch = []
@@ -793,7 +785,7 @@ def train(config: Config, use_wandb: bool = True):
                     
                     kl_div = (batch_old_logprobs - new_logprobs_batch).mean().item()
                     if kl_div > config.phase0_target_kl:
-                        # Skip update if KL too large
+                        # skip update if KL too large
                         continue
                 
                 phase0_optimizer.zero_grad()
@@ -803,10 +795,10 @@ def train(config: Config, use_wandb: bool = True):
                 
                 phase0_losses.append(info)
         
-        # Update Phase-1 (GRPO)
+        # update Phase-1 (GRPO)
         phase1_losses = []
         if len(phase1_data["obs"]) > 0:
-            # Process Phase-1 data (variable K)
+            # process Phase-1 data (variable K)
             phase1_obs_list = phase1_data["obs"]
             phase1_anchors_list = phase1_data["anchors"]
             phase1_candidates_actions_list = phase1_data["candidates_actions"]
@@ -814,9 +806,9 @@ def train(config: Config, use_wandb: bool = True):
             phase1_candidates_rewards_list = phase1_data["candidates_rewards"]
             phase1_masks_list = phase1_data["masks"]
             
-            # Batch process (handle variable K)
+            # batch process (handle variable K)
             for epoch in range(config.epochs):
-                # Create batches
+                # create batches
                 num_phase1_samples = len(phase1_obs_list)
                 indices = torch.randperm(num_phase1_samples, device=device)
                 
@@ -824,13 +816,13 @@ def train(config: Config, use_wandb: bool = True):
                     end = min(start + config.batch_size, num_phase1_samples)
                     batch_indices = indices[start:end]
                     
-                    # Gather batch (will filter out dummy entries next)
+                    # gather batch (will filter out dummy entries next)
                     batch_candidates_actions = [phase1_candidates_actions_list[i] for i in batch_indices]
                     batch_candidates_logprobs = [phase1_candidates_logprobs_list[i] for i in batch_indices]
                     batch_candidates_rewards = [phase1_candidates_rewards_list[i] for i in batch_indices]
                     
-                    # Filter out entries with no valid actions (dummy entries)
-                    # These have all-zero actions/rewards from the continue case
+                    # filter out entries with no valid actions (dummy entries)
+                    # these have all-zero actions/rewards from the continue case
                     valid_batch_indices = []
                     filtered_candidates_actions = []
                     filtered_candidates_logprobs = []
@@ -840,13 +832,13 @@ def train(config: Config, use_wandb: bool = True):
                     filtered_batch_masks = []
                     
                     for i, idx in enumerate(batch_indices):
-                        # Check mask to see if there are valid actions (more reliable than checking actions/rewards)
+                        # check mask to see if there are valid actions (more reliable than checking actions/rewards)
                         mask = phase1_masks_list[idx]
                         valid_count = mask.sum().item() if mask.numel() > 0 else 0
                         
-                        # Skip if no valid actions (dummy entry from continue case)
+                        # skip if no valid actions (dummy entry from continue case)
                         if valid_count == 0:
-                            continue  # Skip dummy entries
+                            continue
                         
                         valid_batch_indices.append(i)
                         filtered_candidates_actions.append(batch_candidates_actions[i])
@@ -856,11 +848,11 @@ def train(config: Config, use_wandb: bool = True):
                         filtered_batch_anchors.append(phase1_anchors_list[idx])
                         filtered_batch_masks.append(mask)
                     
-                    # Skip if all entries in batch were filtered out
+                    # skip if all entries in batch were filtered out
                     if len(filtered_candidates_actions) == 0:
                         continue
                     
-                    # Stack candidates (pad to max K if needed)
+                    # stack candidates (pad to max K if needed)
                     max_k = max(len(a) for a in filtered_candidates_actions)
                     batch_size = len(filtered_candidates_actions)
                     
@@ -878,12 +870,12 @@ def train(config: Config, use_wandb: bool = True):
                         padded_logprobs[i, :k] = logprobs
                         padded_rewards[i, :k] = rewards
                     
-                    # Stack filtered data
+                    # stack filtered data
                     batch_obs = torch.cat(filtered_batch_obs, dim=0)
                     batch_anchors = torch.cat(filtered_batch_anchors, dim=0)
                     batch_masks = torch.cat(filtered_batch_masks, dim=0)
                     
-                    # Compute GRPO loss
+                    # compute GRPO loss
                     loss, info = compute_grpo_loss(
                         policy,
                         batch_obs,
@@ -902,22 +894,22 @@ def train(config: Config, use_wandb: bool = True):
                     
                     phase1_losses.append(info)
         
-        # Logging
+        # logging
         if phase0_losses:
-            # Convert all tensor values to scalars before averaging
-            # Skip tensors that aren't scalar metrics (like 'new_logprobs')
+            # convert all tensor values to scalars before averaging
+            # skip tensors that aren't scalar metrics (like 'new_logprobs')
             phase0_losses_scalar = []
             for d in phase0_losses:
                 scalar_dict = {}
                 for k, v in d.items():
                     if k == 'new_logprobs':
-                        # Skip this - it's a tensor used only for KL check
+                        # skip this - it's a tensor used only for KL check
                         continue
                     if isinstance(v, torch.Tensor):
                         if v.numel() == 1:
                             scalar_dict[k] = v.item()
                         else:
-                            # Skip multi-element tensors
+                            # skip multi-element tensors
                             continue
                     else:
                         scalar_dict[k] = v
@@ -927,7 +919,7 @@ def train(config: Config, use_wandb: bool = True):
                 avg_phase0_loss = {k: np.mean([d[k] for d in phase0_losses_scalar]) for k in phase0_losses_scalar[0]}
                 print(f"Update {update}: Phase-0 loss: {avg_phase0_loss.get('ppo_loss', 0):.4f}")
             
-            # Log to wandb
+            # log to wandb
             if use_wandb:
                 wandb.log({
                     "update": update,
@@ -939,7 +931,7 @@ def train(config: Config, use_wandb: bool = True):
                 }, step=update)
         
         if phase1_losses:
-            # Convert all tensor values to scalars before averaging
+            # convert all tensor values to scalars before averaging
             phase1_losses_scalar = []
             for d in phase1_losses:
                 scalar_dict = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in d.items()}
@@ -948,7 +940,7 @@ def train(config: Config, use_wandb: bool = True):
             avg_phase1_loss = {k: np.mean([d[k] for d in phase1_losses_scalar]) for k in phase1_losses_scalar[0]}
             print(f"Update {update}: Phase-1 loss: {avg_phase1_loss.get('grpo_loss', 0):.4f}")
             
-            # Log to wandb
+            # log to wandb
             if use_wandb:
                 wandb.log({
                     "update": update,
@@ -961,9 +953,9 @@ def train(config: Config, use_wandb: bool = True):
                     "phase1/relative_advantage_std": avg_phase1_loss.get('relative_advantage_std', 0),
                 }, step=update)
         
-        # Log rollout statistics
+        # log rollout statistics
         if use_wandb and phase0_data:
-            # Compute statistics from rollouts
+            # compute statistics from rollouts
             total_rewards = phase0_data["rewards"].sum().item()
             mean_reward = phase0_data["rewards"].mean().item()
             valid_moves = (phase0_data["rewards"] > 0).sum().item()
@@ -977,20 +969,20 @@ def train(config: Config, use_wandb: bool = True):
                 "rollout/legality_rate": valid_moves / max(total_moves, 1),
             }, step=update)
         
-        # Clear buffer
+        # clear buffer
         buffer.clear()
         global_step += config.rollout_steps * config.num_envs
         
-        # Checkpoint
+        # checkpoint
         if (update + 1) % config.checkpoint_interval == 0:
             torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_{update+1}.pt")
     
-    # Save final checkpoint
+    # save final checkpoint
     print(f"\nSaving final checkpoint...")
     torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_final.pt")
     print(f"Training complete! Final checkpoint saved to {config.checkpoint_dir}/policy_final.pt")
     
-    # Finalize wandb run
+    # finalize wandb run
     if use_wandb:
         wandb.finish()
         print("Wandb run completed!")

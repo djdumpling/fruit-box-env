@@ -26,20 +26,20 @@ def compute_oracle_regret(env: Sum10Env, actions_taken: List[Tuple]) -> float:
     total_regret = 0.0
     valid_steps = 0
     
-    # Reset env to initial state
+    # reset env to initial state
     initial_grid = env.grid.copy()
     test_env = Sum10Env()
     test_env.reset(grid=initial_grid)
     
     for action in actions_taken:
-        # Get best immediate move
+        # get best immediate move
         legal_moves = test_env.enumerate_legal()
         if not legal_moves:
             break
         
         best_reward = max(reward for _, reward in legal_moves)
         
-        # Execute actual action
+        # execute actual action
         r1, c1, r2, c2 = action
         step_info = test_env.step(r1, c1, r2, c2)
         
@@ -84,43 +84,43 @@ def evaluate(
         env = env_factory(seed)
         
         obs, info = env.reset()
-        # Store initial grid for oracle regret computation
+        # store initial grid for oracle regret computation
         initial_grid = env.game_env.grid.copy() if hasattr(env, 'game_env') else None
         obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
         
         episode_reward = 0.0
         valid_moves = 0
         total_moves = 0
-        actions_taken = []  # Store (r1, c1, r2, c2) tuples
+        actions_taken = []  # store (r1, c1, r2, c2) tuples
         last_anchor = None
         
-        max_steps = 200  # Safety limit
+        max_steps = 200  # safety limit
         step_count = 0
         
         while step_count < max_steps:
-            # Get action mask
+            # get action mask
             mask = env.get_action_mask().unsqueeze(0).to(device)  # [1, action_dim]
             
-            # Select action
+            # select action
             with torch.no_grad():
                 action, _, _ = policy.get_action_and_value(obs, mask)
             
             action_idx = action[0].item()
             
-            # Track action before step (for Phase-1)
+            # track action before step (for Phase-1)
             if env.phase == 1 and env.selected_anchor is not None:
                 r1, c1 = env.selected_anchor
                 r2, c2 = env.flat_idx_to_extent(r1, c1, action_idx)
                 last_anchor = (r1, c1, r2, c2)
             
-            # Step environment
+            # step environment
             obs_new, reward, terminated, truncated, info = env.step(action_idx)
             obs_new = obs_new.unsqueeze(0).to(device)
             
             episode_reward += reward
             total_moves += 1
             
-            # Track valid moves and actions
+            # track valid moves and actions
             if reward > 0:
                 valid_moves += 1
                 if last_anchor:
@@ -132,14 +132,14 @@ def evaluate(
             if terminated or truncated:
                 break
         
-        # Compute oracle regret if we have actions and initial grid
+        # compute oracle regret if we have actions and initial grid
         if actions_taken and initial_grid is not None:
             test_env = Sum10Env()
             test_env.reset(grid=initial_grid.copy())
             oracle_regret = compute_oracle_regret(test_env, actions_taken)
             oracle_regrets.append(oracle_regret)
         else:
-            oracle_regrets.append(0.0)  # No valid actions, no regret
+            oracle_regrets.append(0.0)  # no valid actions, no regret
         
         total_rewards.append(episode_reward)
         legality_rate = valid_moves / max(total_moves, 1) if total_moves > 0 else 0.0
@@ -149,7 +149,7 @@ def evaluate(
             avg_cleared = episode_reward / valid_moves
             cells_cleared_per_move.append(avg_cleared)
     
-    # Compute statistics
+    # compute statistics
     results = {
         "mean_reward": np.mean(total_rewards),
         "std_reward": np.std(total_rewards),

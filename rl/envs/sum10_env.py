@@ -48,12 +48,12 @@ class Sum10GymEnv(gym.Env):
         elif self._initial_grid is not None:
             initial_grid = self._initial_grid.copy()
         
-        # If no grid provided, generate a random valid grid
+        # if no grid provided, generate a random valid grid
         if initial_grid is None:
-            # Generate random grid with values 1-9
+            # generate random grid with values 1-9
             rng = np.random.default_rng(seed)
             initial_grid = rng.integers(1, 10, size=(10, 17), dtype=np.uint8)
-            # Ensure sum is divisible by 10 (with max iterations to avoid infinite loop)
+            # ensure sum is divisible by 10 (with max iterations to avoid infinite loop)
             max_iter = 1000
             iter_count = 0
             while initial_grid.sum() % 10 != 0 and iter_count < max_iter:

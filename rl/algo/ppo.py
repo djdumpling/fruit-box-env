@@ -27,19 +27,19 @@ def compute_gae(
     batch_size, seq_len = rewards.shape
     device = rewards.device
     
-    # Convert dones to float for arithmetic
+    # convert dones to float for arithmetic
     dones_float = dones.float()
     
-    # Compute TD errors
+    # compute TD errors
     # values[:, :-1] predicts values[:, 1:], with last value being bootstrap
-    # We need to handle the last step specially
+    # we need to handle the last step specially
     advantages = torch.zeros_like(rewards)
     last_gae = 0
     
-    # Process backwards through sequence
+    # process backwards through sequence
     for t in reversed(range(seq_len)):
         if t == seq_len - 1:
-            # Last step: no next value
+            # last step: no next value
             next_value = 0.0
         else:
             next_value = values[:, t + 1]
@@ -50,7 +50,7 @@ def compute_gae(
         # GAE
         advantages[:, t] = last_gae = delta + gamma * lam * (1 - dones_float[:, t]) * last_gae
     
-    # Returns = advantages + values
+    # returns = advantages + values
     returns = advantages + values
     
     return advantages, returns
@@ -90,12 +90,12 @@ def compute_ppo_loss(
         loss: Scalar loss tensor
         info: Dictionary with loss components and statistics
     """
-    # Get current policy outputs
+    # get current policy outputs
     logits, values = policy(obs, action_mask)  # [batch_size, action_dim], [batch_size, 1]
     values = values.squeeze(-1)  # [batch_size]
     
-    # Compute new logprobs
-    # Extract valid logits for each batch item
+    # compute new logprobs
+    # extract valid logits for each batch item
     new_logprobs = []
     entropies = []
     for b in range(obs.size(0)):
@@ -110,29 +110,29 @@ def compute_ppo_loss(
     new_logprobs = torch.stack(new_logprobs)  # [batch_size]
     entropies = torch.stack(entropies)  # [batch_size]
     
-    # Policy loss (PPO clipped)
+    # policy loss (PPO clipped)
     ratio = torch.exp(new_logprobs - old_logprobs)  # [batch_size]
     clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
     policy_loss1 = ratio * advantages
     policy_loss2 = clipped_ratio * advantages
     policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
     
-    # Value loss (MSE)
+    # value loss (MSE)
     value_loss = ((values - returns) ** 2).mean()
     
-    # Entropy bonus
+    # entropy bonus
     entropy_bonus = entropies.mean()
     
-    # Entropy floor penalty (to prevent over-confidence)
+    # entropy floor penalty (to prevent over-confidence)
     entropy_penalty = 0.0
     if entropy_target > 0.0 and entropy_penalty_coef > 0.0:
         entropy_shortfall = torch.clamp(entropy_target - entropy_bonus, min=0.0)
         entropy_penalty = entropy_penalty_coef * entropy_shortfall
     
-    # Total loss
+    # total loss
     loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus + entropy_penalty
     
-    # Statistics
+    # statistics
     info = {
         "ppo_loss": loss.item(),
         "policy_loss": policy_loss.item(),
@@ -142,7 +142,7 @@ def compute_ppo_loss(
         "mean_advantage": advantages.mean().item(),
         "mean_ratio": ratio.mean().item(),
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),
-        # Note: new_logprobs is not included as it's a tensor used only for KL computation
+        # note: new_logprobs is not included as it's a tensor used only for KL computation
     }
     
     return loss, info

@@ -30,11 +30,11 @@ class TwoPhaseWrapper(gym.Wrapper):
         self.illegal_penalty = illegal_penalty
         self.legal_action_bonus = legal_action_bonus
         
-        # Phase state: 0 = selecting anchor, 1 = selecting extent
+        # phase state: 0 = selecting anchor, 1 = selecting extent
         self.phase = 0
         self.selected_anchor = None  # (r1, c1) tuple
         
-        # Access underlying Sum10Env
+        # access underlying Sum10Env
         if hasattr(env, 'game_env'):
             self.game_env = env.game_env
         elif isinstance(env, Sum10Env):
@@ -42,19 +42,19 @@ class TwoPhaseWrapper(gym.Wrapper):
         else:
             raise ValueError("env must have game_env attribute or be Sum10Env")
         
-        # Phase-0: select anchor from 170 cells (10*17)
+        # phase-0: select anchor from 170 cells (10*17)
         self.phase0_action_dim = 170
         
-        # Phase-1: variable action space (depends on anchor)
-        # Max is when anchor is (0,0): 10*17 = 170
+        # phase-1: variable action space (depends on anchor)
+        # max is when anchor is (0,0): 10*17 = 170
         self.phase1_max_action_dim = 170
         
-        # Observation: [4, 10, 17] tensor
+        # observation: [4, 10, 17] tensor
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(4, 10, 17), dtype=np.float32
         )
         
-        # Action space: Discrete(170) for Phase-0, variable for Phase-1
+        # action space: Discrete(170) for Phase-0, variable for Phase-1
         self.action_space = spaces.Discrete(self.phase0_action_dim)
     
     def anchor_to_flat_idx(self, r1: int, c1: int) -> int:
@@ -96,41 +96,41 @@ class TwoPhaseWrapper(gym.Wrapper):
             mask: [action_dim] binary tensor, 1 for valid actions
         """
         if self.phase == 0:
-            # Phase-0: all anchors are valid
+            # phase-0: all anchors are valid
             return torch.ones(self.phase0_action_dim, dtype=torch.bool)
         else:
-            # Phase-1: mask based on r2>=r1, c2>=c1
+            # phase-1: mask based on r2>=r1, c2>=c1
             r1, c1 = self.selected_anchor
             action_dim = (10 - r1) * (17 - c1)
             mask = torch.ones(action_dim, dtype=torch.bool)
             
-            # Sigmoid curriculum annealing: illegal-exposure from 0→1 over curriculum_updates
+            # sigmoid curriculum annealing: illegal-exposure from 0→1 over curriculum_updates
             if self.curriculum_legal_only and self.current_update < self.curriculum_updates:
                 legal_mask = self.get_legal_only_mask()
                 
-                # Sigmoid annealing: illegal_exposure goes from 0 to 1
+                # sigmoid annealing: illegal_exposure goes from 0 to 1
                 # sigmoid(x) = 1 / (1 + exp(-k*(x - x0)))
-                # We want sigmoid(0) ≈ 0 and sigmoid(curriculum_updates) ≈ 1
-                # Using standard sigmoid centered at curriculum_updates/2 with steepness k
+                # we want sigmoid(0) ≈ 0 and sigmoid(curriculum_updates) ≈ 1
+                # using standard sigmoid centered at curriculum_updates/2 with steepness k
                 import math
                 x = self.current_update
                 x0 = self.curriculum_updates / 2.0
-                k = 6.0 / self.curriculum_updates  # Steepness parameter
+                k = 6.0 / self.curriculum_updates  # steepness parameter
                 illegal_exposure = 1.0 / (1.0 + math.exp(-k * (x - x0)))
                 
-                # Start with only legal actions, gradually allow illegal actions
+                # start with only legal actions, gradually allow illegal actions
                 if illegal_exposure < 0.05:
-                    # Strict phase: only legal actions
+                    # strict phase: only legal actions
                     mask = mask & legal_mask
                 else:
-                    # Annealing phase: allow illegal actions proportionally
+                    # annealing phase: allow illegal actions proportionally
                     illegal_mask = ~legal_mask
                     num_illegal = illegal_mask.sum().item()
                     if num_illegal > 0:
                         num_to_allow = max(1, int(num_illegal * illegal_exposure))
                         illegal_indices = torch.nonzero(illegal_mask, as_tuple=False).squeeze(-1)
                         if len(illegal_indices) > 0:
-                            # Randomly sample illegal actions to allow
+                            # randomly sample illegal actions to allow
                             num_to_allow = min(num_to_allow, len(illegal_indices))
                             perm = torch.randperm(len(illegal_indices))[:num_to_allow]
                             selected_illegal = illegal_indices[perm]
@@ -150,7 +150,7 @@ class TwoPhaseWrapper(gym.Wrapper):
         action_dim = (10 - r1) * (17 - c1)
         mask = torch.zeros(action_dim, dtype=torch.bool)
         
-        # Check each valid extent
+        # check each valid extent
         for idx in range(action_dim):
             r2, c2 = self.flat_idx_to_extent(r1, c1, idx)
             if self.game_env.box_sum(r1, c1, r2, c2) == 10:
@@ -162,19 +162,19 @@ class TwoPhaseWrapper(gym.Wrapper):
         """Build 4-channel observation tensor."""
         grid = self.game_env.grid.astype(np.float32)
         
-        # Channel 0: normalized values
+        # channel 0: normalized values
         value_norm = grid / 9.0
         
-        # Channel 1: nonzero mask
+        # channel 1: nonzero mask
         nonzero_mask = (grid > 0).astype(np.float32)
         
-        # Channel 2: anchor mask (zeros in Phase-0, selected anchor=1 in Phase-1)
+        # channel 2: anchor mask (zeros in Phase-0, selected anchor=1 in Phase-1)
         anchor_mask = np.zeros((10, 17), dtype=np.float32)
         if self.phase == 1 and self.selected_anchor is not None:
             r1, c1 = self.selected_anchor
             anchor_mask[r1, c1] = 1.0
         
-        # Channel 3: phase mask (all zeros in Phase-0, all ones in Phase-1)
+        # channel 3: phase mask (all zeros in Phase-0, all ones in Phase-1)
         phase_mask = np.full((10, 17), float(self.phase), dtype=np.float32)
         
         obs = np.stack([value_norm, nonzero_mask, anchor_mask, phase_mask], axis=0)
@@ -199,42 +199,42 @@ class TwoPhaseWrapper(gym.Wrapper):
         Phase-1: action is extent index, execute move and transition to Phase-0
         """
         if self.phase == 0:
-            # Phase-0: select anchor
+            # phase-0: select anchor
             r1, c1 = self.flat_idx_to_anchor(action)
             self.selected_anchor = (r1, c1)
             self.phase = 1
             
-            # Return observation, no reward yet
+            # return observation, no reward yet
             obs_4ch = self._build_observation()
             info = {"phase": 1, "anchor": (r1, c1)}
             
             return torch.from_numpy(obs_4ch), 0.0, False, False, info
         
         else:
-            # Phase-1: select extent and execute move
+            # phase-1: select extent and execute move
             r1, c1 = self.selected_anchor
             r2, c2 = self.flat_idx_to_extent(r1, c1, action)
             
-            # Execute move on underlying environment
-            # Convert to MultiDiscrete action format
+            # execute move on underlying environment
+            # convert to MultiDiscrete action format
             multi_action = np.array([r1, c1, r2, c2], dtype=np.int32)
             obs, reward, terminated, truncated, info = self.env.step(multi_action)
             
-            # Apply rewards/penalties based on action legality
+            # apply rewards/penalties based on action legality
             is_valid = info.get("valid", True)
             if is_valid:
-                # Add bonus for legal actions
+                # add bonus for legal actions
                 reward += self.legal_action_bonus
             else:
-                # Apply penalty for illegal actions (after curriculum phase)
+                # apply penalty for illegal actions (after curriculum phase)
                 if self.current_update >= self.curriculum_updates:
                     reward += self.illegal_penalty
             
-            # Reset phase state
+            # reset phase state
             self.phase = 0
             self.selected_anchor = None
             
-            # If episode ended, reset phase state
+            # if episode ended, reset phase state
             if terminated or truncated:
                 self.phase = 0
                 self.selected_anchor = None
