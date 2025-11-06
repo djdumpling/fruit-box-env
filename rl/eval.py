@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from typing import List, Optional, Tuple, Dict
 from tqdm import tqdm
+from datasets import load_dataset
 
 from rl.envs.sum10_env import Sum10GymEnv
 from rl.envs.split_wrapper import TwoPhaseWrapper
