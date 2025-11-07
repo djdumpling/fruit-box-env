@@ -39,7 +39,7 @@ class Config:
     num_envs: int = 16
     rollout_steps: int = 128
     batch_size: int = 512
-    epochs: int = 3
+    epochs: int = 4 
     
     # Phase-0 (PPO) hyperparameters
     phase0_lr: float = 1e-4
@@ -48,11 +48,11 @@ class Config:
     phase0_value_coef: float = 0.8
     
     # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 1e-3
-    phase1_clip_eps: float = 0.3
+    phase1_lr: float = 3e-4  # reduced from 1e-3 (3x Phase-0 LR instead of 10x) to prevent instability
+    phase1_clip_eps: float = 0.2  # reduced from 0.3 for more conservative updates
     grpo_k: int = 16
     grpo_tau: float = 0.7
-    frozen_refresh_interval: int = 75 
+    frozen_refresh_interval: int = 100  # reduced from 75, less frequent refreshes
     grpo_temperature: float = 1.0
     min_reward_std: float = 0.01
     
@@ -60,7 +60,9 @@ class Config:
     max_updates: int = 2500
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.02
+    entropy_coef: float = 0.05  # Increased from 0.02 for stronger exploration signal
+    entropy_target: float = 0.5  # Target minimum entropy to prevent collapse
+    entropy_penalty_coef: float = 0.2  # Strong penalty for entropy below target
     grad_clip: float = 1.0
     lr_warmup_steps: int = 20
     
@@ -593,6 +595,8 @@ def train(config: Config, use_wandb: bool = True):
                 "phase1_lr": config.phase1_lr,
                 "phase1_clip_eps": config.phase1_clip_eps,
                 "entropy_coef": config.entropy_coef,
+                "entropy_target": config.entropy_target,
+                "entropy_penalty_coef": config.entropy_penalty_coef,
                 "epochs": config.epochs,
                 "grad_clip": config.grad_clip,
                 "grpo_k": config.grpo_k,
@@ -769,6 +773,8 @@ def train(config: Config, use_wandb: bool = True):
                     config.phase0_clip_eps,
                     config.phase0_value_coef,
                     config.entropy_coef,
+                    config.entropy_target,
+                    config.entropy_penalty_coef,
                 )
                 
                 # check KL constraint (compute KL divergence)
@@ -790,7 +796,12 @@ def train(config: Config, use_wandb: bool = True):
                 
                 phase0_optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
+                total_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
+                
+                # Log gradient norm if close to clipping threshold (indicates potential instability)
+                if use_wandb and total_norm > config.grad_clip * 0.9:
+                    wandb.log({"debug/grad_norm": total_norm.item()}, step=update, commit=False)
+                
                 phase0_optimizer.step()
                 
                 phase0_losses.append(info)
@@ -889,7 +900,12 @@ def train(config: Config, use_wandb: bool = True):
                     
                     phase1_optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
+                    total_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
+                    
+                    # Log gradient norm if close to clipping threshold (indicates potential instability)
+                    if use_wandb and total_norm > config.grad_clip * 0.9:
+                        wandb.log({"debug/phase1_grad_norm": total_norm.item()}, step=update, commit=False)
+                    
                     phase1_optimizer.step()
                     
                     phase1_losses.append(info)
@@ -918,6 +934,34 @@ def train(config: Config, use_wandb: bool = True):
             if phase0_losses_scalar and len(phase0_losses_scalar) > 0:
                 avg_phase0_loss = {k: np.mean([d[k] for d in phase0_losses_scalar]) for k in phase0_losses_scalar[0]}
                 print(f"Update {update}: Phase-0 loss: {avg_phase0_loss.get('ppo_loss', 0):.4f}")
+                
+                # Monitor entropy and intervene before collapse
+                current_entropy = avg_phase0_loss.get('entropy', 5.0)
+                
+                # Early warning: entropy dropping too fast - intervene proactively
+                if current_entropy < 0.3 and update > 100:
+                    print(f"\n{'='*70}")
+                    print(f"WARNING: Entropy dangerously low ({current_entropy:.3f}) at update {update}")
+                    print(f"Triggering early intervention: increasing entropy_coef and reducing learning rates")
+                    print(f"{'='*70}\n")
+                    
+                    # Increase entropy coefficient immediately
+                    config.entropy_coef = min(0.15, config.entropy_coef * 1.5)
+                    
+                    # Reduce learning rates to stabilize
+                    for param_group in phase0_optimizer.param_groups:
+                        param_group['lr'] *= 0.7
+                    for param_group in phase1_optimizer.param_groups:
+                        param_group['lr'] *= 0.7
+                    
+                    # Log intervention
+                    if use_wandb:
+                        wandb.log({
+                            "recovery/entropy_rescue": 1.0,
+                            "recovery/new_entropy_coef": config.entropy_coef,
+                            "recovery/new_phase0_lr": phase0_optimizer.param_groups[0]['lr'],
+                            "recovery/new_phase1_lr": phase1_optimizer.param_groups[0]['lr'],
+                        }, step=update)
             
             # log to wandb
             if use_wandb:
@@ -927,6 +971,7 @@ def train(config: Config, use_wandb: bool = True):
                     "phase0/policy_loss": avg_phase0_loss.get('policy_loss', 0),
                     "phase0/value_loss": avg_phase0_loss.get('value_loss', 0),
                     "phase0/entropy": avg_phase0_loss.get('entropy', 0),
+                    "phase0/entropy_penalty": avg_phase0_loss.get('entropy_penalty', 0),
                     "phase0/clip_fraction": avg_phase0_loss.get('clip_fraction', 0),
                 }, step=update)
         
