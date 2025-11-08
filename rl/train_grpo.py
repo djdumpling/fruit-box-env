@@ -61,13 +61,13 @@ class Config:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     entropy_coef: float = 0.05  # increased from 0.02 for stronger exploration signal
-    entropy_target: float = 0.7  # target minimum entropy to prevent collapse
+    entropy_target: float = 0.5  # target minimum entropy to prevent collapse
     entropy_penalty_coef: float = 0.2  # strong penalty for entropy below target
     grad_clip: float = 1.0
     lr_warmup_steps: int = 20
     
     # Curriculum learning
-    curriculum_updates: int = 500
+    curriculum_updates: int = 400
     illegal_penalty: float = -0.1
     
     # Other
