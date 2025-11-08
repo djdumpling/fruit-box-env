@@ -45,7 +45,7 @@ class Config:
     phase0_lr: float = 1e-4
     phase0_clip_eps: float = 0.12
     phase0_target_kl: float = 0.015
-    phase0_value_coef: float = 1.0
+    phase0_value_coef: float = 0.8
     
     # Phase-1 (GRPO) hyperparameters
     phase1_lr: float = 3e-4  # reduced from 1e-3 (3x Phase-0 LR instead of 10x) to prevent instability
@@ -59,7 +59,7 @@ class Config:
     # Shared hyperparameters
     max_updates: int = 2500
     gamma: float = 0.995
-    gae_lambda: float = 0.98
+    gae_lambda: float = 0.95
     entropy_coef: float = 0.05  # increased from 0.02 for stronger exploration signal
     entropy_target: float = 0.7  # target minimum entropy to prevent collapse
     entropy_penalty_coef: float = 0.2  # strong penalty for entropy below target
