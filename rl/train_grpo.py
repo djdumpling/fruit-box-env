@@ -38,7 +38,7 @@ class Config:
     # Data collection
     num_envs: int = 16
     rollout_steps: int = 128
-    batch_size: int = 768
+    batch_size: int = 512
     epochs: int = 4 
     
     # Phase-0 (PPO) hyperparameters
