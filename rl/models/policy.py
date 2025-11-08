@@ -9,8 +9,8 @@ class CNNPolicy(nn.Module):
     """CNN policy network with policy and value heads.
     
     Architecture:
-    - Conv2d(4, 32, 3x3) → ReLU → Conv2d(32, 64, 3x3) → ReLU
-    - Flatten → Linear(64*8*15, 256) → ReLU
+    - Conv2d(4, 32, 3x3) → BatchNorm → GELU → Conv2d(32, 64, 3x3) → BatchNorm → GELU
+    - Flatten → Linear(64*8*15, 256) → GELU → LayerNorm
     - Policy head: Linear(256, action_dim)
     - Value head: Linear(256, 1)
     """
@@ -28,8 +28,10 @@ class CNNPolicy(nn.Module):
         # input: (4, 10, 17)
         # conv1: 3x3, no padding → (32, 8, 15)
         self.conv1 = nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=0)
+        self.bn1 = nn.BatchNorm2d(32)
         # conv2: 3x3, padding=1 → (64, 8, 15) (maintains spatial size)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
         
         # flattened size: 64 * 8 * 15 = 7680
         self.flattened_size = 64 * 8 * 15
@@ -37,13 +39,16 @@ class CNNPolicy(nn.Module):
         # feature extractor
         self.feature_extractor = nn.Sequential(
             self.conv1,
-            nn.ReLU(),
+            self.bn1,
+            nn.GELU(),
             self.conv2,
-            nn.ReLU(),
+            self.bn2,
+            nn.GELU(),
         )
         
         # fully connected layers
         self.fc = nn.Linear(self.flattened_size, 256)
+        self.ln = nn.LayerNorm(256)
         
         # policy head
         self.policy_head = nn.Linear(256, action_dim)
@@ -69,7 +74,8 @@ class CNNPolicy(nn.Module):
         # extract features
         x = self.feature_extractor(obs)  # [batch, 64, 8, 15]
         x = x.view(x.size(0), -1)  # [batch, 7680]
-        x = F.relu(self.fc(x))  # [batch, 256]
+        x = F.gelu(self.fc(x))  # [batch, 256]
+        x = self.ln(x)  # [batch, 256] - LayerNorm before heads
         
         # policy logits
         logits = self.policy_head(x)  # [batch, action_dim]

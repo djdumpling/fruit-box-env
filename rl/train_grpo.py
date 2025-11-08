@@ -38,14 +38,14 @@ class Config:
     # Data collection
     num_envs: int = 16
     rollout_steps: int = 128
-    batch_size: int = 512
+    batch_size: int = 768
     epochs: int = 4 
     
     # Phase-0 (PPO) hyperparameters
     phase0_lr: float = 1e-4
     phase0_clip_eps: float = 0.12
     phase0_target_kl: float = 0.015
-    phase0_value_coef: float = 0.8
+    phase0_value_coef: float = 1.0
     
     # Phase-1 (GRPO) hyperparameters
     phase1_lr: float = 3e-4  # reduced from 1e-3 (3x Phase-0 LR instead of 10x) to prevent instability
@@ -59,15 +59,15 @@ class Config:
     # Shared hyperparameters
     max_updates: int = 2500
     gamma: float = 0.995
-    gae_lambda: float = 0.95
-    entropy_coef: float = 0.05  # Increased from 0.02 for stronger exploration signal
-    entropy_target: float = 0.5  # Target minimum entropy to prevent collapse
-    entropy_penalty_coef: float = 0.2  # Strong penalty for entropy below target
+    gae_lambda: float = 0.98
+    entropy_coef: float = 0.05  # increased from 0.02 for stronger exploration signal
+    entropy_target: float = 0.7  # target minimum entropy to prevent collapse
+    entropy_penalty_coef: float = 0.2  # strong penalty for entropy below target
     grad_clip: float = 1.0
     lr_warmup_steps: int = 20
     
     # Curriculum learning
-    curriculum_updates: int = 400
+    curriculum_updates: int = 500
     illegal_penalty: float = -0.1
     
     # Other
