@@ -53,7 +53,7 @@ class Config:
     grpo_k: int = 16
     grpo_tau: float = 0.7
     frozen_refresh_interval: int = 100  # reduced from 75, less frequent refreshes
-    grpo_temperature: float = 1.0
+    grpo_temperature: float = 1.0 ### CONSIDER SWITCHING TO 1.5 LATER ###
     min_reward_std: float = 0.01
     
     # Shared hyperparameters
@@ -430,8 +430,8 @@ def collect_rollouts(
                         "debug/phase1_reward_diversity": rel_adv_std,
                         "debug/phase1_candidate_rewards_min": candidates_rewards.min().item(),
                         "debug/phase1_candidate_rewards_max": candidates_rewards.max().item(),
-                        "debug/phase1_num_legal_candidates": (candidates_rewards > 0).sum().item(),
-                        "debug/phase1_num_penalized_candidates": (candidates_rewards == config.illegal_penalty).sum().item(),
+                        "debug/phase1_num_legal_candidates": (candidates_rewards >= 0).sum().item(),  # legal = non-negative (includes reward == 0)
+                        "debug/phase1_num_penalized_candidates": (candidates_rewards < 0).sum().item(),  # penalized = negative (all negative rewards)
                     }, commit=False)
                 
                 # store candidates with original indices for consistency
