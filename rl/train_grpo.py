@@ -231,11 +231,6 @@ def visualize_action(
     total_reward: float,
 ):
     """Visualize the grid with the selected rectangle highlighted."""
-    print("\n" + "=" * 70)
-    print(f"Turn: {turn} | Reward: {reward:.1f} | Total Reward: {total_reward:.1f}")
-    print(f"Action: Rectangle from ({r1},{c1}) to ({r2},{c2})")
-    print("=" * 70)
-    
     # Extract rectangle values
     rect_values = []
     rect_sum = 0
@@ -245,9 +240,7 @@ def visualize_action(
             rect_values.append(val)
             rect_sum += val
     
-    print(f"Rectangle values: {rect_values}")
-    print(f"Rectangle sum: {rect_sum}")
-    print()
+    print(f"Turn {turn}: ({r1},{c1})→({r2},{c2}) | Reward: {reward:.1f} | Total: {total_reward:.1f} | Sum: {rect_sum}")
     
     # Print grid with rectangle highlighted
     for r in range(10):
@@ -260,8 +253,7 @@ def visualize_action(
             else:
                 row_str.append(f" {val:2d} ")
         print("".join(row_str))
-    
-    print("=" * 70 + "\n")
+    print()
 
 
 def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
@@ -570,8 +562,6 @@ def train(config: Config, use_wandb: bool = True):
         config: Training configuration
         use_wandb: Whether to use wandb logging (default: True)
     """
-    print("Starting training setup...")
-    
     # initialize wandb
     if use_wandb:
         # set wandb to use a temp directory to avoid cluttering repo
@@ -615,33 +605,26 @@ def train(config: Config, use_wandb: bool = True):
         print("Wandb initialized!")
     
     # set seeds
-    print("Setting seeds...")
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     
     # setup
-    print("Creating device...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Device: {device} | Seed: {config.seed} | Envs: {config.num_envs}")
     
     # create directories
-    print("Creating directories...")
     import os
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     
     # create environments (create first, reset later to avoid segfault)
-    print(f"Creating {config.num_envs} environments...")
     envs = []
     for i in range(config.num_envs):
-        if (i + 1) % 10 == 0:
-            print(f"  Created {i+1}/{config.num_envs} environments...")
         env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates)
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
     # create policy
-    print("Creating policy...")
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     print("Policy created")
     
@@ -650,7 +633,6 @@ def train(config: Config, use_wandb: bool = True):
     print("Creating optimizers...")
     phase0_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase0_lr)
     phase1_optimizer = torch.optim.Adam(policy.parameters(), lr=config.phase1_lr)
-    print("Optimizers created")
     
     # learning rate warmup helper function
     def get_lr_multiplier(step: int, warmup_steps: int) -> float:
@@ -663,12 +645,10 @@ def train(config: Config, use_wandb: bool = True):
     frozen_policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     frozen_policy.load_state_dict(policy.state_dict())
     frozen_policy.eval()
-    print("Frozen policy created")
     
     # create buffer
     print("Creating buffer...")
     buffer = RolloutBuffer(config.rollout_steps, config.num_envs, (4, 10, 17), device)
-    print("Buffer created")
     
     
     # training loop
@@ -690,7 +670,6 @@ def train(config: Config, use_wandb: bool = True):
         if update > 0 and update % config.frozen_refresh_interval == 0:
             frozen_policy.load_state_dict(policy.state_dict())
             frozen_policy.eval()
-            print(f"Frozen policy refreshed at update {update}")
         
         # collect rollouts
         visualize_this_update = (update % config.render_interval == 0)
@@ -704,9 +683,7 @@ def train(config: Config, use_wandb: bool = True):
         
         # visualize actions if requested
         if visualize_this_update and visualization_data:
-            print(f"\n{'='*70}")
-            print(f"VISUALIZATION - Update {update}")
-            print(f"{'='*70}")
+            print(f"\nUpdate {update} visualization:")
             total_reward = 0.0
             for reward, grid, r1, c1, r2, c2, turn in visualization_data:
                 total_reward += reward
@@ -940,10 +917,7 @@ def train(config: Config, use_wandb: bool = True):
                 
                 # Early warning: entropy dropping too fast - intervene proactively
                 if current_entropy < 0.3 and update > 100:
-                    print(f"\n{'='*70}")
-                    print(f"WARNING: Entropy dangerously low ({current_entropy:.3f}) at update {update}")
-                    print(f"Triggering early intervention: increasing entropy_coef and reducing learning rates")
-                    print(f"{'='*70}\n")
+                    print(f"\nWARNING: Low entropy ({current_entropy:.3f}) at update {update} - adjusting hyperparameters\n")
                     
                     # Increase entropy coefficient immediately
                     config.entropy_coef = min(0.15, config.entropy_coef * 1.5)
@@ -1020,18 +994,34 @@ def train(config: Config, use_wandb: bool = True):
         
         # checkpoint
         if (update + 1) % config.checkpoint_interval == 0:
-            torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_{update+1}.pt")
+            checkpoint_path = f"{config.checkpoint_dir}/policy_{update+1}.pt"
+            torch.save(policy.state_dict(), checkpoint_path)
+            
+            # upload checkpoint to wandb as artifact
+            if use_wandb:
+                artifact = wandb.Artifact(
+                    name=f"checkpoint-{update+1}",
+                    type="model",
+                    description=f"Policy checkpoint at update {update+1}",
+                )
+                artifact.add_file(checkpoint_path)
+                wandb.log_artifact(artifact)
     
     # save final checkpoint
-    print(f"\nSaving final checkpoint...")
-    torch.save(policy.state_dict(), f"{config.checkpoint_dir}/policy_final.pt")
-    print(f"Training complete! Final checkpoint saved to {config.checkpoint_dir}/policy_final.pt")
+    final_checkpoint_path = f"{config.checkpoint_dir}/policy_final.pt"
+    torch.save(policy.state_dict(), final_checkpoint_path)
+    print(f"\nTraining complete! Final checkpoint: {final_checkpoint_path}")
     
-    # finalize wandb run
+    # upload final checkpoint to wandb as artifact
     if use_wandb:
-        wandb.finish()
-        print("Wandb run completed!")
-    
+        artifact = wandb.Artifact(
+            name="checkpoint-final",
+            type="model",
+            description=f"Final policy checkpoint after {config.max_updates} updates",
+        )
+        artifact.add_file(final_checkpoint_path)
+        wandb.log_artifact(artifact)
+        wandb.finish()    
 
 
 def main():

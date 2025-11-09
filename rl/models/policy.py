@@ -9,7 +9,7 @@ class CNNPolicy(nn.Module):
     """CNN policy network with policy and value heads.
     
     Architecture:
-    - Conv2d(4, 32, 3x3) → BatchNorm → GELU → Conv2d(32, 64, 3x3) → BatchNorm → GELU
+    - Conv2d(4, 32, 3x3) → GroupNorm → GELU → Conv2d(32, 64, 3x3) → GroupNorm → GELU
     - Flatten → Linear(64*8*15, 256) → GELU → LayerNorm
     - Policy head: Linear(256, action_dim)
     - Value head: Linear(256, 1)
@@ -28,10 +28,10 @@ class CNNPolicy(nn.Module):
         # input: (4, 10, 17)
         # conv1: 3x3, no padding → (32, 8, 15)
         self.conv1 = nn.Conv2d(obs_shape[0], 32, kernel_size=3, padding=0)
-        self.bn1 = nn.BatchNorm2d(32)
+        self.gn1 = nn.GroupNorm(num_groups=8, num_channels=32)
         # conv2: 3x3, padding=1 → (64, 8, 15) (maintains spatial size)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
+        self.gn2 = nn.GroupNorm(num_groups=8, num_channels=64)
         
         # flattened size: 64 * 8 * 15 = 7680
         self.flattened_size = 64 * 8 * 15
@@ -39,10 +39,10 @@ class CNNPolicy(nn.Module):
         # feature extractor
         self.feature_extractor = nn.Sequential(
             self.conv1,
-            self.bn1,
+            self.gn1,
             nn.GELU(),
             self.conv2,
-            self.bn2,
+            self.gn2,
             nn.GELU(),
         )
         
