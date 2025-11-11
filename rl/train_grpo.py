@@ -48,31 +48,32 @@ class Config:
     epochs: int = 4  # Keep: standard PPO epochs
     
     # Phase-0 (PPO) hyperparameters
-    phase0_lr: float = 5e-5  # REDUCED from 1e-4: pretrained weights need fine-tuning, not large updates
+    phase0_lr: float = 2e-5  # REDUCED from 5e-5: more conservative fine-tuning for highly confident pretrained policy
     phase0_clip_eps: float = 0.12  # Keep: conservative clipping prevents large policy changes
-    phase0_target_kl: float = 0.01  # TIGHTER from 0.015: starting from good policy, constrain updates more
+    phase0_target_kl: float = 0.005  # TIGHTER from 0.01: prevent large policy changes that disrupt pretrained policy
     phase0_value_coef: float = 0.8  # Keep: standard value
     
     # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 1.5e-4  # REDUCED from 3e-4: match reduced Phase-0 LR (3x ratio maintained)
-    phase1_clip_eps: float = 0.25  # Keep: conservative updates
+    phase1_lr: float = 3e-5  # FURTHER REDUCED from 6e-5: prevent large policy changes that cause mean ratio spikes
+    phase1_clip_eps: float = 0.15  # REDUCED from 0.25: tighter clipping to prevent mean ratio spikes (7+ observed)
+    phase1_target_ratio: float = 1.2  # Maximum allowed mean ratio for Phase-1 (prevent catastrophic policy changes)
     grpo_k: int = 24  # INCREASED from 16: more candidates for exploration from low-entropy pretrained policy
-    frozen_refresh_interval: int = 75  # MORE FREQUENT from 100: refresh frozen policy more often early in training
-    grpo_temperature: float = 1.5  # INCREASED from 1.2: higher temperature for more exploration diversity
+    frozen_refresh_interval: int = 200  # FURTHER INCREASED from 150: prevent refreshing frozen policy during unstable adaptation
+    grpo_temperature: float = 2.0  # FURTHER INCREASED from 1.5: much higher temperature to maintain reward diversity
     min_reward_std: float = 0.01  # Keep: minimum diversity threshold
     
     # Shared hyperparameters
     max_updates: int = 2500  # REDUCED from 3000: starting from good baseline, less training needed
     gamma: float = 0.995  # Keep: discount factor unchanged
     gae_lambda: float = 0.95  # Keep: GAE lambda unchanged
-    entropy_coef: float = 0.08  # INCREASED from 0.05: pretrained policy has low entropy (98.7% acc), need more exploration
+    entropy_coef: float = 0.03  # REDUCED from 0.08: pretrained policy already has good exploration, don't force entropy increase
     entropy_target: float = 0.5  # Keep: target minimum entropy
     entropy_penalty_coef: float = 0.3  # INCREASED from 0.2: stronger penalty to prevent entropy collapse from pretrained
     grad_clip: float = 1.0  # Keep: standard gradient clipping
-    lr_warmup_steps: int = 50  # INCREASED from 20: longer warmup for pretrained weights to adapt gradually
+    lr_warmup_steps: int = 100  # INCREASED from 50: more gradual adaptation for pretrained weights
     
     # Curriculum learning
-    curriculum_updates: int = 100  # REDUCED from 200: SFT already knows legal moves, shorter curriculum
+    curriculum_updates: int = 0  # DISABLED: SFT policy already knows legal moves at 98.7% accuracy, curriculum constrains exploration
     illegal_penalty: float = -0.1  # Keep: penalty for illegal moves
     
     # Other
@@ -590,6 +591,7 @@ def train(config: Config, use_wandb: bool = True):
                 "phase0_value_coef": config.phase0_value_coef,
                 "phase1_lr": config.phase1_lr,
                 "phase1_clip_eps": config.phase1_clip_eps,
+                "phase1_target_ratio": config.phase1_target_ratio,
                 "entropy_coef": config.entropy_coef,
                 "entropy_target": config.entropy_target,
                 "entropy_penalty_coef": config.entropy_penalty_coef,
@@ -636,8 +638,20 @@ def train(config: Config, use_wandb: bool = True):
     if config.load_checkpoint:
         print(f"Loading checkpoint from {config.load_checkpoint}...")
         checkpoint = torch.load(config.load_checkpoint, map_location=device)
+        
+        # Load checkpoint (includes both policy and value heads)
         policy.load_state_dict(checkpoint)
-        print("Checkpoint loaded successfully!")
+        
+        # Re-initialize value head: SFT value estimates are wrong for RL returns
+        # Keep policy head weights from SFT, but reset value head
+        print("Re-initializing value head (SFT value estimates don't match RL returns)...")
+        for param in policy.value_head.parameters():
+            if len(param.shape) >= 2:
+                torch.nn.init.xavier_uniform_(param)
+            else:
+                torch.nn.init.zeros_(param)
+        
+        print("Checkpoint loaded successfully! (Policy head from SFT, value head re-initialized)")
     else:
         print("Policy created (no checkpoint loaded)")
     
@@ -888,6 +902,17 @@ def train(config: Config, use_wandb: bool = True):
                         batch_masks,
                         config.phase1_clip_eps,
                     )
+                    
+                    # Check mean ratio constraint for Phase-1 (prevent catastrophic policy changes)
+                    mean_ratio = info.get('mean_ratio', 1.0)
+                    if mean_ratio > config.phase1_target_ratio:
+                        # Skip update if mean ratio too large (policy changing too fast)
+                        if use_wandb:
+                            wandb.log({
+                                "debug/phase1_ratio_skip": 1.0,
+                                "debug/phase1_mean_ratio": mean_ratio,
+                            }, step=update, commit=False)
+                        continue
                     
                     phase1_optimizer.zero_grad()
                     loss.backward()
