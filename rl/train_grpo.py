@@ -48,27 +48,27 @@ class Config:
     epochs: int = 4  # Keep: standard PPO epochs
     
     # Phase-0 (PPO) hyperparameters
-    phase0_lr: float = 2e-5  # REDUCED from 5e-5: more conservative fine-tuning for highly confident pretrained policy
+    phase0_lr: float = 3e-5  # INCREASED from 2e-5: balance between stability and learning speed
     phase0_clip_eps: float = 0.12  # Keep: conservative clipping prevents large policy changes
-    phase0_target_kl: float = 0.005  # TIGHTER from 0.01: prevent large policy changes that disrupt pretrained policy
+    phase0_target_kl: float = 0.008  # LOOSENED from 0.005: allow more updates while still constraining
     phase0_value_coef: float = 0.8  # Keep: standard value
     
     # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 3e-5  # FURTHER REDUCED from 6e-5: prevent large policy changes that cause mean ratio spikes
-    phase1_clip_eps: float = 0.15  # REDUCED from 0.25: tighter clipping to prevent mean ratio spikes (7+ observed)
-    phase1_target_ratio: float = 1.2  # Maximum allowed mean ratio for Phase-1 (prevent catastrophic policy changes)
-    grpo_k: int = 24  # INCREASED from 16: more candidates for exploration from low-entropy pretrained policy
-    frozen_refresh_interval: int = 200  # FURTHER INCREASED from 150: prevent refreshing frozen policy during unstable adaptation
-    grpo_temperature: float = 2.0  # FURTHER INCREASED from 1.5: much higher temperature to maintain reward diversity
+    phase1_lr: float = 5e-5  # INCREASED from 3e-5: need faster learning, maintain 1.67x ratio with Phase-0
+    phase1_clip_eps: float = 0.2  # INCREASED from 0.15: allow more policy change while still clipping
+    phase1_target_ratio: float = 2.5  # LOOSENED from 1.2: allow necessary updates, prevent only extreme spikes (7+)
+    grpo_k: int = 24  # Keep: more candidates for exploration
+    frozen_refresh_interval: int = 100  # REDUCED from 200: refresh more often to maintain diversity
+    grpo_temperature: float = 1.8  # REDUCED from 2.0: balance exploration without too much randomness
     min_reward_std: float = 0.01  # Keep: minimum diversity threshold
     
     # Shared hyperparameters
-    max_updates: int = 2500  # REDUCED from 3000: starting from good baseline, less training needed
+    max_updates: int = 2500  # Keep: starting from good baseline
     gamma: float = 0.995  # Keep: discount factor unchanged
     gae_lambda: float = 0.95  # Keep: GAE lambda unchanged
-    entropy_coef: float = 0.03  # REDUCED from 0.08: pretrained policy already has good exploration, don't force entropy increase
+    entropy_coef: float = 0.05  # INCREASED from 0.03: encourage exploration, entropy too low (1→1.4→decreasing)
     entropy_target: float = 0.5  # Keep: target minimum entropy
-    entropy_penalty_coef: float = 0.3  # INCREASED from 0.2: stronger penalty to prevent entropy collapse from pretrained
+    entropy_penalty_coef: float = 0.2  # REDUCED from 0.3: less aggressive penalty, allow entropy to increase naturally
     grad_clip: float = 1.0  # Keep: standard gradient clipping
     lr_warmup_steps: int = 100  # INCREASED from 50: more gradual adaptation for pretrained weights
     
