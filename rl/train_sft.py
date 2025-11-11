@@ -222,8 +222,66 @@ def load_and_process_dataset(
                 # invalid move - stop processing this trajectory
                 break
     
+    total_examples = len(phase0_data) + len(phase1_data)
     print(f"Processed {len(phase0_data)} Phase-0 examples and {len(phase1_data)} Phase-1 examples")
+    print(f"Total training examples: {total_examples}")
     return phase0_data, phase1_data
+
+
+def log_example_moves(
+    policy: nn.Module,
+    obs: torch.Tensor,
+    actions: torch.Tensor,
+    masks: torch.Tensor,
+    batch_data: List[Dict],
+    epoch: int,
+    device: torch.device,
+    num_examples: int = 5,
+):
+    """Log example moves predicted by the model."""
+    policy.eval()
+    with torch.no_grad():
+        logits, _ = policy(obs, masks)
+        
+        examples_logged = 0
+        for i in range(min(num_examples, len(batch_data))):
+            if examples_logged >= num_examples:
+                break
+                
+            data_item = batch_data[i]
+            mask = masks[i]
+            valid_count = mask.sum().item()
+            
+            if valid_count == 0:
+                continue
+            
+            # get predictions
+            valid_logits = logits[i][:valid_count]
+            pred_action = valid_logits.argmax().item()
+            true_action = actions[i].item()
+            
+            # determine phase based on data structure
+            is_phase0 = 'anchor' not in data_item
+            
+            if is_phase0:
+                # Phase-0: anchor selection
+                pred_r1, pred_c1 = flat_idx_to_anchor(pred_action)
+                true_r1, true_c1 = flat_idx_to_anchor(true_action)
+                
+                move_str = f"Phase-0: Predicted anchor=({pred_r1},{pred_c1}), True=({true_r1},{true_c1})"
+            else:
+                # Phase-1: extent selection
+                anchor_idx = data_item['anchor'].item()
+                anchor_r1, anchor_c1 = flat_idx_to_anchor(anchor_idx)
+                pred_r2, pred_c2 = flat_idx_to_extent(anchor_r1, anchor_c1, pred_action)
+                true_r2, true_c2 = flat_idx_to_extent(anchor_r1, anchor_c1, true_action)
+                
+                move_str = f"Phase-1: Anchor=({anchor_r1},{anchor_c1}), Predicted extent=({pred_r2},{pred_c2}), True=({true_r2},{true_c2})"
+            
+            print(f"  Example {examples_logged + 1}: {move_str}")
+            examples_logged += 1
+        
+        policy.train()
 
 
 def compute_sft_loss(
@@ -343,15 +401,20 @@ def train(config: Config):
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
-        # combine Phase-0 and Phase-1 data
+        # combine Phase-0 and Phase-1 data (using ALL datapoints)
         all_data = phase0_data + phase1_data
         random.shuffle(all_data)
+        print(f"  Training on {len(all_data)} total examples ({len(phase0_data)} Phase-0 + {len(phase1_data)} Phase-1)")
         
         policy.train()
         epoch_losses = []
         epoch_accuracies = []
+        batch_data_for_logging = None
+        batch_obs_for_logging = None
+        batch_actions_for_logging = None
+        batch_masks_for_logging = None
         
-        for start in tqdm(range(0, len(all_data), config.batch_size), desc="Training"):
+        for batch_idx, start in enumerate(tqdm(range(0, len(all_data), config.batch_size), desc="Training")):
             batch_data = all_data[start:start + config.batch_size]
             
             # stack batches (masks already padded to 170)
@@ -374,11 +437,33 @@ def train(config: Config):
             
             epoch_losses.append(info['loss'])
             epoch_accuracies.append(info['accuracy'])
+            
+            # save first batch for logging example moves
+            if batch_idx == 0:
+                batch_data_for_logging = batch_data
+                batch_obs_for_logging = batch_obs
+                batch_actions_for_logging = batch_actions
+                batch_masks_for_logging = batch_masks
         
         # logging
         avg_loss = np.mean(epoch_losses)
         avg_accuracy = np.mean(epoch_accuracies)
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
+        
+        # log example moves
+        if batch_data_for_logging is not None:
+            print("  Example moves:")
+            log_example_moves(
+                policy,
+                batch_obs_for_logging,
+                batch_actions_for_logging,
+                batch_masks_for_logging,
+                batch_data_for_logging,
+                epoch + 1,
+                device,
+                num_examples=5,
+            )
+        
         wandb.log({
             "epoch": epoch + 1,
             "train/loss": avg_loss,
@@ -398,16 +483,23 @@ def train(config: Config):
             artifact.add_file(checkpoint_path)
             wandb.log_artifact(artifact)
     
-    # save final checkpoint
+    # save final checkpoint and weights
     final_checkpoint_path = f"{config.checkpoint_dir}/policy_sft_final.pt"
+    final_weights_path = f"{config.checkpoint_dir}/policy_sft_final_weights.pt"
+    
     torch.save(policy.state_dict(), final_checkpoint_path)
-    print(f"\nTraining complete! Final checkpoint: {final_checkpoint_path}")
+    torch.save(policy.state_dict(), final_weights_path)  # explicit weights file
+    print(f"\nTraining complete!")
+    print(f"  Final checkpoint: {final_checkpoint_path}")
+    print(f"  Final weights: {final_weights_path}")
+    
     artifact = wandb.Artifact(
         name="sft-checkpoint-final",
         type="model",
         description=f"Final SFT checkpoint after {config.epochs} epochs",
     )
     artifact.add_file(final_checkpoint_path)
+    artifact.add_file(final_weights_path)
     wandb.log_artifact(artifact)
     wandb.finish()
 
@@ -422,7 +514,7 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=2)
+    parser.add_argument("--checkpoint_interval", type=int, default=100)
     args = parser.parse_args()
     
     config = Config(
