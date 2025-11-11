@@ -1,6 +1,8 @@
 """
 python rl/train_grpo.py --seed 42
 
+python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch100.pt
+
 python rl/eval.py \
   --checkpoint checkpoints/policy_final.pt \
   --num_episodes 100 \
@@ -34,40 +36,44 @@ from fruit_box import Sum10Env
 
 @dataclass
 class Config:
-    """Training configuration."""
+    """Training configuration.
+    
+    Hyperparameters optimized for SFT-pretrained initialization (98.7% accuracy).
+    Key changes: lower LRs, higher entropy/exploration, reduced training length.
+    """
     # Data collection
-    num_envs: int = 16
-    rollout_steps: int = 128
-    batch_size: int = 512
-    epochs: int = 4 
+    num_envs: int = 16  # Keep: parallel envs help regardless of initialization
+    rollout_steps: int = 128  # Keep: standard value
+    batch_size: int = 512  # Keep: good balance
+    epochs: int = 4  # Keep: standard PPO epochs
     
     # Phase-0 (PPO) hyperparameters
-    phase0_lr: float = 1e-4
-    phase0_clip_eps: float = 0.12
-    phase0_target_kl: float = 0.015
-    phase0_value_coef: float = 0.8
+    phase0_lr: float = 5e-5  # REDUCED from 1e-4: pretrained weights need fine-tuning, not large updates
+    phase0_clip_eps: float = 0.12  # Keep: conservative clipping prevents large policy changes
+    phase0_target_kl: float = 0.01  # TIGHTER from 0.015: starting from good policy, constrain updates more
+    phase0_value_coef: float = 0.8  # Keep: standard value
     
     # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 3e-4  # reduced from 1e-3 (3x Phase-0 LR instead of 10x) to prevent instability
-    phase1_clip_eps: float = 0.25  # reduced from 0.3 for more conservative updates
-    grpo_k: int = 16
-    frozen_refresh_interval: int = 100  # reduced from 75, less frequent refreshes
-    grpo_temperature: float = 1.2  # slight increase
-    min_reward_std: float = 0.01
+    phase1_lr: float = 1.5e-4  # REDUCED from 3e-4: match reduced Phase-0 LR (3x ratio maintained)
+    phase1_clip_eps: float = 0.25  # Keep: conservative updates
+    grpo_k: int = 24  # INCREASED from 16: more candidates for exploration from low-entropy pretrained policy
+    frozen_refresh_interval: int = 75  # MORE FREQUENT from 100: refresh frozen policy more often early in training
+    grpo_temperature: float = 1.5  # INCREASED from 1.2: higher temperature for more exploration diversity
+    min_reward_std: float = 0.01  # Keep: minimum diversity threshold
     
     # Shared hyperparameters
-    max_updates: int = 3000
-    gamma: float = 0.995
-    gae_lambda: float = 0.95
-    entropy_coef: float = 0.05  # reduced from 0.05 to allow entropy to decrease gradually (moderate reduction preserves reward diversity)
-    entropy_target: float = 0.5  # target minimum entropy to prevent collapse
-    entropy_penalty_coef: float = 0.2  # penalty for entropy below target (prevents collapse, doesn't affect high entropy)
-    grad_clip: float = 1.0
-    lr_warmup_steps: int = 20
+    max_updates: int = 2500  # REDUCED from 3000: starting from good baseline, less training needed
+    gamma: float = 0.995  # Keep: discount factor unchanged
+    gae_lambda: float = 0.95  # Keep: GAE lambda unchanged
+    entropy_coef: float = 0.08  # INCREASED from 0.05: pretrained policy has low entropy (98.7% acc), need more exploration
+    entropy_target: float = 0.5  # Keep: target minimum entropy
+    entropy_penalty_coef: float = 0.3  # INCREASED from 0.2: stronger penalty to prevent entropy collapse from pretrained
+    grad_clip: float = 1.0  # Keep: standard gradient clipping
+    lr_warmup_steps: int = 50  # INCREASED from 20: longer warmup for pretrained weights to adapt gradually
     
     # Curriculum learning
-    curriculum_updates: int = 400
-    illegal_penalty: float = -0.1
+    curriculum_updates: int = 100  # REDUCED from 200: SFT already knows legal moves, shorter curriculum
+    illegal_penalty: float = -0.1  # Keep: penalty for illegal moves
     
     # Other
     seed: int = 42
@@ -75,6 +81,7 @@ class Config:
     checkpoint_interval: int = 500
     render_interval: int = 5
     render_env_idx: int = 0
+    load_checkpoint: Optional[str] = None  # path to checkpoint to load at start
 
 
 class RolloutBuffer:
@@ -624,7 +631,15 @@ def train(config: Config, use_wandb: bool = True):
     
     # create policy
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
-    print("Policy created")
+    
+    # load checkpoint if provided
+    if config.load_checkpoint:
+        print(f"Loading checkpoint from {config.load_checkpoint}...")
+        checkpoint = torch.load(config.load_checkpoint, map_location=device)
+        policy.load_state_dict(checkpoint)
+        print("Checkpoint loaded successfully!")
+    else:
+        print("Policy created (no checkpoint loaded)")
     
     # create separate optimizers for Phase-0 and Phase-1
     # learning rates will be warmed up during training
@@ -643,6 +658,7 @@ def train(config: Config, use_wandb: bool = True):
     frozen_policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     frozen_policy.load_state_dict(policy.state_dict())
     frozen_policy.eval()
+    print("Frozen policy initialized (matches current policy)")
     
     # create buffer
     print("Creating buffer...")
@@ -1027,9 +1043,11 @@ def main():
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--load-checkpoint", type=str, default=None, 
+                       help="Path to checkpoint file to load at start (e.g., 'checkpoints/policy_sft_epoch100.pt')")
     args = parser.parse_args()
     
-    config = Config(seed=args.seed)
+    config = Config(seed=args.seed, load_checkpoint=args.load_checkpoint)
     train(config, use_wandb=not args.no_wandb)
 
 
