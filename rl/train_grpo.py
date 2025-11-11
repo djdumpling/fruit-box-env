@@ -49,7 +49,7 @@ class Config:
     
     # Phase-1 (GRPO) hyperparameters
     phase1_lr: float = 3e-4  # reduced from 1e-3 (3x Phase-0 LR instead of 10x) to prevent instability
-    phase1_clip_eps: float = 0.2  # reduced from 0.3 for more conservative updates
+    phase1_clip_eps: float = 0.25  # reduced from 0.3 for more conservative updates
     grpo_k: int = 16
     frozen_refresh_interval: int = 100  # reduced from 75, less frequent refreshes
     grpo_temperature: float = 1.2  # slight increase
@@ -59,10 +59,10 @@ class Config:
     max_updates: int = 3000
     gamma: float = 0.995
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.025  # reduced from 0.05 to allow entropy to decrease gradually (moderate reduction preserves reward diversity)
+    entropy_coef: float = 0.05  # reduced from 0.05 to allow entropy to decrease gradually (moderate reduction preserves reward diversity)
     entropy_target: float = 0.5  # target minimum entropy to prevent collapse
     entropy_penalty_coef: float = 0.2  # penalty for entropy below target (prevents collapse, doesn't affect high entropy)
-    grad_clip: float = 2.0  # increased from 1.0 to allow larger gradient updates (grad_norm consistently > 1.0)
+    grad_clip: float = 1.0
     lr_warmup_steps: int = 20
     
     # Curriculum learning
