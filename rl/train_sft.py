@@ -12,7 +12,7 @@ before training starts:
     policy.load_state_dict(torch.load("checkpoints/policy_sft_final.pt", map_location=device))
 
 Usage:
-    python rl/train_sft.py --seed 42 --epochs 10 --batch_size 64 --lr 1e-4
+    python rl/train_sft.py --seed 42 --epochs 200 --batch_size 64 --lr 1e-4
 """
 
 import sys
@@ -35,7 +35,6 @@ from datasets import load_dataset
 import wandb
 
 from rl.models.policy import CNNPolicy
-from fruit_box import Sum10Env
 
 
 @dataclass
@@ -159,22 +158,21 @@ def load_and_process_dataset(
     phase0_data = []
     phase1_data = []
     
+    # debug: track first few examples
+    debug_count = 0
+    max_debug_examples = 3
+    
     # process each trajectory
     for key, trajectory in episodes.items():
         if not trajectory:
             continue
         
-        # get initial grid
-        initial_state = trajectory[0]
-        initial_grid = np.array(initial_state["grid"], dtype=np.uint8)
-        
-        # simulate environment to build observations
-        env = Sum10Env()
-        env.reset(grid=initial_grid)
-        current_grid = env.grid.copy()
-        
         # process each step in the trajectory
         for step in trajectory:
+            # extract grid directly from dataset
+            grid = np.array(step["grid"], dtype=np.uint8)
+            
+            # extract action coordinates
             action = step.get("action", {})
             r1 = action.get("r1", -1)
             c1 = action.get("c1", -1)
@@ -185,8 +183,31 @@ def load_and_process_dataset(
             if r1 == -1 or c1 == -1 or r2 == -1 or c2 == -1:
                 continue
             
+            # validate coordinates
+            if not (0 <= r1 < 10 and 0 <= c1 < 17 and 0 <= r2 < 10 and 0 <= c2 < 17):
+                print(f"Warning: Invalid coordinates - r1={r1}, c1={c1}, r2={r2}, c2={c2}")
+                continue
+            
+            # validate extent is valid (r2 >= r1, c2 >= c1)
+            if not (r1 <= r2 and c1 <= c2):
+                print(f"Warning: Invalid extent - anchor=({r1},{c1}), extent=({r2},{c2})")
+                continue
+            
+            # debug output for first few examples
+            if debug_count < max_debug_examples:
+                print(f"\n[DEBUG] Example {debug_count + 1}:")
+                print(f"  Grid shape: {grid.shape}")
+                print(f"  Grid sample (first row): {grid[0, :5].tolist()}...")
+                print(f"  Action: r1={r1}, c1={c1}, r2={r2}, c2={c2}")
+                print(f"  Anchor flat idx: {anchor_to_flat_idx(r1, c1)}")
+                print(f"  Extent flat idx: {extent_to_flat_idx(r1, c1, r2, c2)}")
+                # verify round-trip conversion
+                recovered_r2, recovered_c2 = flat_idx_to_extent(r1, c1, extent_to_flat_idx(r1, c1, r2, c2))
+                print(f"  Round-trip check: ({r2},{c2}) -> {extent_to_flat_idx(r1, c1, r2, c2)} -> ({recovered_r2},{recovered_c2})")
+                debug_count += 1
+            
             # Phase-0: select anchor (r1, c1)
-            phase0_obs = build_observation(current_grid, phase=0, selected_anchor=None)
+            phase0_obs = build_observation(grid, phase=0, selected_anchor=None)
             phase0_action = anchor_to_flat_idx(r1, c1)
             phase0_mask = torch.ones(170, dtype=torch.bool)  # all anchors valid
             
@@ -197,7 +218,7 @@ def load_and_process_dataset(
             })
             
             # Phase-1: select extent (r2, c2) given anchor (r1, c1)
-            phase1_obs = build_observation(current_grid, phase=1, selected_anchor=(r1, c1))
+            phase1_obs = build_observation(grid, phase=1, selected_anchor=(r1, c1))
             phase1_action_compact = extent_to_flat_idx(r1, c1, r2, c2)
             
             # build action mask for Phase-1
@@ -213,14 +234,6 @@ def load_and_process_dataset(
                 'mask': phase1_mask,
                 'anchor': torch.tensor(phase0_action, dtype=torch.long),
             })
-            
-            # execute action to update grid state
-            step_info = env.step(r1, c1, r2, c2)
-            if step_info.valid:
-                current_grid = env.grid.copy()
-            else:
-                # invalid move - stop processing this trajectory
-                break
     
     total_examples = len(phase0_data) + len(phase1_data)
     print(f"Processed {len(phase0_data)} Phase-0 examples and {len(phase1_data)} Phase-1 examples")
@@ -377,8 +390,11 @@ def train(config: Config):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     
-    # setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # setup device (prefer CUDA, then CPU - skip MPS due to performance issues)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device} | Seed: {config.seed}")
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     
@@ -511,10 +527,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area")
+    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=100)
+    parser.add_argument("--checkpoint_interval", type=int, default=10)
     args = parser.parse_args()
     
     config = Config(
@@ -534,4 +550,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
