@@ -56,7 +56,7 @@ class Config:
     phase1_lr: float = 2.5e-5  # was 5e-5, same reasoning as phase0
     phase1_clip_eps: float = 0.15  # was 0.2
     phase1_target_ratio: float = 2.0  # was 2.5
-    grpo_k: int = 20  # was 24, don't need as much exploration
+    grpo_k: int = 16  # was 24, don't need as much exploration
     frozen_refresh_interval: int = 100
     grpo_temperature: float = 1.5  # was 1.8, policy is already good
     min_reward_std: float = 0.01
@@ -82,6 +82,7 @@ class Config:
     render_interval: int = 5
     render_env_idx: int = 0
     load_checkpoint: Optional[str] = None  # path to checkpoint to load at start
+    use_legal_only_masks: bool = True  # use legal-only masks (required when loading from SFT)
 
 
 class RolloutBuffer:
@@ -264,7 +265,7 @@ def visualize_action(
 
 def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
     """Create environment"""
-    env = Sum10GymEnv(initial_grid=initial_grid)
+    env = Sum10GymEnv(initial_grid=initial_grid, seed=seed)
     env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
     return env
 
@@ -298,7 +299,38 @@ def collect_rollouts(
         masks_list = []
         phases = []
         for env in envs:
-            mask = env.get_action_mask()
+            if config.use_legal_only_masks:
+                # use legal-only masks (required when loading from SFT)
+                if env.phase == 0:
+                    # phase-0: compute legal anchors (anchors with at least one legal extent)
+                    legal_anchors_set = set()
+                    grid = env.game_env.grid
+                    for anchor_r1 in range(10):
+                        for anchor_c1 in range(17):
+                            anchor_idx = env.anchor_to_flat_idx(anchor_r1, anchor_c1)
+                            # check if this anchor has any legal extents
+                            max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
+                            has_legal = False
+                            for extent_idx in range(max_valid_count):
+                                r2_test, c2_test = env.flat_idx_to_extent(anchor_r1, anchor_c1, extent_idx)
+                                if env.game_env.box_sum(anchor_r1, anchor_c1, r2_test, c2_test) == 10:
+                                    reward_test = env.game_env.box_nonzero_count(anchor_r1, anchor_c1, r2_test, c2_test)
+                                    if reward_test > 0:
+                                        has_legal = True
+                                        break
+                            if has_legal:
+                                legal_anchors_set.add(anchor_idx)
+                    # build mask: True only at legal anchor positions
+                    mask = torch.zeros(170, dtype=torch.bool)
+                    for legal_anchor_idx in sorted(legal_anchors_set):
+                        mask[legal_anchor_idx] = True
+                else:
+                    # phase-1: use legal-only mask (only extents that sum to 10)
+                    # get_legal_only_mask() returns compact mask, we'll handle padding later
+                    mask = env.get_legal_only_mask()
+            else:
+                # use standard action mask (all geometrically valid actions)
+                mask = env.get_action_mask()
             masks_list.append(mask)
             phases.append(env.phase)
         
@@ -311,7 +343,17 @@ def collect_rollouts(
         # phase-0: select anchor
         if phase0_mask.any():
             phase0_obs = obs[phase0_mask]
-            phase0_masks = torch.stack([masks_list[i] for i in phase0_indices], dim=0).to(obs.device)
+            # pad phase-0 masks to 170 if needed
+            phase0_masks_padded = []
+            for i in phase0_indices:
+                mask = masks_list[i]
+                if mask.shape[0] < 170:
+                    padded = torch.zeros(170, dtype=torch.bool)
+                    padded[:mask.shape[0]] = mask
+                    phase0_masks_padded.append(padded)
+                else:
+                    phase0_masks_padded.append(mask)
+            phase0_masks = torch.stack(phase0_masks_padded, dim=0).to(obs.device)
             phase0_actions, phase0_logprobs,                 phase0_values = policy.get_action_and_value(
                 phase0_obs, phase0_masks
             )
@@ -351,7 +393,21 @@ def collect_rollouts(
                 anchor_idx = phase1_anchors[i].item()
                 
                 # get valid action mask for this env
-                valid_mask = phase1_masks_list[i]
+                valid_mask_compact = phase1_masks_list[i]
+                # handle variable-size masks (legal-only masks may be smaller than 170)
+                # map compact mask to full 170-space
+                r1, c1 = env.selected_anchor
+                action_dim = (10 - r1) * (17 - c1)
+                valid_mask = torch.zeros(170, dtype=torch.bool, device=obs.device)
+                if valid_mask_compact.shape[0] <= action_dim:
+                    # map compact indices to full space
+                    for compact_idx in range(min(valid_mask_compact.shape[0], action_dim)):
+                        if valid_mask_compact[compact_idx]:
+                            # extent index in compact space maps to same index in full space for this anchor
+                            valid_mask[compact_idx] = True
+                else:
+                    # mask is already in full space
+                    valid_mask[:valid_mask_compact.shape[0]] = valid_mask_compact[:170]
                 valid_action_count = valid_mask.sum().item()
                 
                 # enhanced debug logging for Phase-1 (log every 50 updates)

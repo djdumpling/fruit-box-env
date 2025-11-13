@@ -17,11 +17,14 @@ class Sum10GymEnv(gym.Env):
         initial_grid: Optional[np.ndarray] = None,
         max_steps: int = 85,
         render_mode: Optional[str] = None,
+        seed: Optional[int] = None,
     ):
         super().__init__()
         self.max_steps = max_steps
         self.render_mode = render_mode
         self._initial_grid = initial_grid.copy() if initial_grid is not None else None
+        self._default_seed = seed
+        self._rng = np.random.default_rng(seed) if seed is not None else None
         self.game_env = Sum10Env()
         
         # observation space: 10x17 grid with values 0-9
@@ -39,7 +42,9 @@ class Sum10GymEnv(gym.Env):
         return [(r1, c1, r2, c2) for ((r1, c1, r2, c2), _) in legal_moves]
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-        super().reset(seed=seed)
+        # use provided seed, or fall back to default seed for this environment
+        reset_seed = seed if seed is not None else self._default_seed
+        super().reset(seed=reset_seed)
         
         # get initial grid from options or use stored/default
         initial_grid = None
@@ -50,8 +55,11 @@ class Sum10GymEnv(gym.Env):
         
         # if no grid provided, generate a random valid grid
         if initial_grid is None:
-            # generate random grid with values 1-9
-            rng = np.random.default_rng(seed)
+            # use environment's persistent RNG if no seed was explicitly provided, otherwise create new one
+            if seed is None and self._rng is not None:
+                rng = self._rng
+            else:
+                rng = np.random.default_rng(reset_seed)
             initial_grid = rng.integers(1, 10, size=(10, 17), dtype=np.uint8)
             # ensure sum is divisible by 10 (with max iterations to avoid infinite loop)
             max_iter = 1000
