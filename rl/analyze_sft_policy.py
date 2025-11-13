@@ -309,19 +309,53 @@ def run_policy_on_random_grid(
             print_grid(validation_env.grid.copy(), f"Grid before move {move_num + 1}")
         
         # Phase-0: Select anchor
+        # CRITICAL: Use legal-only anchors (anchors that have at least one legal extent)
+        # This matches the SFT training setup
         phase0_obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
-        phase0_mask = wrapped_env.get_action_mask().unsqueeze(0).to(device)  # [1, 170]
+        
+        # Find all anchors that have at least one legal extent
+        legal_anchors_set = set()
+        for anchor_r1 in range(10):
+            for anchor_c1 in range(17):
+                anchor_idx = flat_idx_to_anchor(anchor_r1 * 17 + anchor_c1)
+                # Check if this anchor has any legal extents
+                max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
+                has_legal = False
+                for extent_idx in range(max_valid_count):
+                    r2_test, c2_test = flat_idx_to_extent(anchor_r1, anchor_c1, extent_idx)
+                    if validation_env.box_sum(anchor_r1, anchor_c1, r2_test, c2_test) == 10:
+                        reward_test = validation_env.box_nonzero_count(anchor_r1, anchor_c1, r2_test, c2_test)
+                        if reward_test > 0:
+                            has_legal = True
+                            break
+                if has_legal:
+                    legal_anchors_set.add(anchor_r1 * 17 + anchor_c1)
+        
+        # Build mask: True only at positions corresponding to legal anchors
+        phase0_mask = torch.zeros(170, dtype=torch.bool)
+        for legal_anchor_idx in sorted(legal_anchors_set):
+            phase0_mask[legal_anchor_idx] = True
+        phase0_mask = phase0_mask.unsqueeze(0).to(device)  # [1, 170]
+        
+        if phase0_mask.sum() == 0:
+            print("  No legal anchors available!")
+            break
         
         with torch.no_grad():
             logits, _ = policy(phase0_obs, phase0_mask)
-            anchor_idx = logits.argmax(dim=1).item()
+            # Extract logits only at legal anchor positions
+            legal_anchor_indices = torch.nonzero(phase0_mask[0], as_tuple=False).squeeze(-1)
+            valid_logits = logits[0][legal_anchor_indices]
+            anchor_idx_compact = valid_logits.argmax().item()
+            anchor_idx = legal_anchor_indices[anchor_idx_compact].item()
             # Also get top-3 anchors for debugging
-            top3_anchors = logits[0].topk(3)
+            top3_anchors_compact = valid_logits.topk(min(3, valid_logits.numel()))
+            top3_anchors = [(legal_anchor_indices[idx].item(), valid_logits[idx].item()) for idx in top3_anchors_compact.indices]
         
         r1, c1 = flat_idx_to_anchor(anchor_idx)
         print(f"Phase-0: Selected anchor ({r1}, {c1}) [index {anchor_idx}]")
         if verbose:
-            print(f"  Top-3 anchor logits: {[(flat_idx_to_anchor(idx.item()), logits[0][idx].item()) for idx in top3_anchors.indices]}")
+            print(f"  Top-3 anchor logits: {[(flat_idx_to_anchor(idx), logit) for idx, logit in top3_anchors]}")
         
         # Step Phase-0
         obs, reward, terminated, truncated, info = wrapped_env.step(anchor_idx)

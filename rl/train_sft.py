@@ -35,6 +35,7 @@ from datasets import load_dataset
 import wandb
 
 from rl.models.policy import CNNPolicy
+from fruit_box import Sum10Env
 
 
 @dataclass
@@ -124,6 +125,60 @@ def build_observation(grid: np.ndarray, phase: int, selected_anchor: Optional[Tu
     return obs
 
 
+def get_grid_hash(grid: np.ndarray) -> bytes:
+    """Get hashable representation of grid for caching."""
+    return grid.tobytes()
+
+
+def compute_legal_anchors(grid: np.ndarray) -> set:
+    """Compute all anchors that have at least one legal extent.
+    
+    Cached per grid state to avoid recomputation.
+    """
+    temp_env = Sum10Env()
+    temp_env.reset(grid=grid.copy())
+    
+    legal_anchors_set = set()
+    for anchor_r1 in range(10):
+        for anchor_c1 in range(17):
+            anchor_idx = anchor_to_flat_idx(anchor_r1, anchor_c1)
+            # check if this anchor has any legal extents
+            max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
+            has_legal = False
+            for extent_idx in range(max_valid_count):
+                r2_test, c2_test = flat_idx_to_extent(anchor_r1, anchor_c1, extent_idx)
+                if temp_env.box_sum(anchor_r1, anchor_c1, r2_test, c2_test) == 10:
+                    reward_test = temp_env.box_nonzero_count(anchor_r1, anchor_c1, r2_test, c2_test)
+                    if reward_test > 0:
+                        has_legal = True
+                        break
+            if has_legal:
+                legal_anchors_set.add(anchor_idx)
+    
+    return legal_anchors_set
+
+
+def compute_legal_extents(grid: np.ndarray, r1: int, c1: int) -> set:
+    """Compute all legal extents for a given anchor.
+    
+    Cached per (grid, anchor) to avoid recomputation.
+    """
+    temp_env = Sum10Env()
+    temp_env.reset(grid=grid.copy())
+    
+    legal_extents_set = set()
+    max_valid_count = (10 - r1) * (17 - c1)
+    for extent_idx in range(max_valid_count):
+        r2_test, c2_test = flat_idx_to_extent(r1, c1, extent_idx)
+        # Check if this extent sums to 10
+        if temp_env.box_sum(r1, c1, r2_test, c2_test) == 10:
+            reward_test = temp_env.box_nonzero_count(r1, c1, r2_test, c2_test)
+            if reward_test > 0:  # Must clear at least one cell
+                legal_extents_set.add(extent_idx)
+    
+    return legal_extents_set
+
+
 def load_and_process_dataset(
     dataset_name: str,
     dataset_split: str,
@@ -158,17 +213,27 @@ def load_and_process_dataset(
     phase0_data = []
     phase1_data = []
     
+    # Performance optimization: cache legal anchors/extents per grid state
+    legal_anchors_cache = {}  # grid_hash -> set of legal anchor indices
+    legal_extents_cache = {}  # (grid_hash, anchor_idx) -> set of legal extent indices
+    
     # debug: track first few examples
     debug_count = 0
     max_debug_examples = 3
     
+    # Count total steps for progress tracking
+    total_steps = sum(len(trajectory) for trajectory in episodes.values())
+    print(f"Processing {total_steps} trajectory steps...")
+    
     # process each trajectory
-    for key, trajectory in episodes.items():
+    processed_steps = 0
+    for key, trajectory in tqdm(episodes.items(), desc="Processing trajectories", unit="traj"):
         if not trajectory:
             continue
         
         # process each step in the trajectory
         for step in trajectory:
+            processed_steps += 1
             # extract grid directly from dataset
             grid = np.array(step["grid"], dtype=np.uint8)
             
@@ -207,9 +272,27 @@ def load_and_process_dataset(
                 debug_count += 1
             
             # Phase-0: select anchor (r1, c1)
-            phase0_obs = build_observation(grid, phase=0, selected_anchor=None)
+            # only include anchors that have at least one legal extent
+            # ensures the policy learns to select anchors that can lead to valid moves
+            
+            # Performance optimization: use cache for legal anchors
+            grid_hash = get_grid_hash(grid)
+            if grid_hash not in legal_anchors_cache:
+                legal_anchors_cache[grid_hash] = compute_legal_anchors(grid)
+            legal_anchors_set = legal_anchors_cache[grid_hash]
+            
+            # verify expert anchor is legal (should always be true)
             phase0_action = anchor_to_flat_idx(r1, c1)
-            phase0_mask = torch.ones(170, dtype=torch.bool)  # all anchors valid
+            if phase0_action not in legal_anchors_set:
+                # skip
+                print(f"Warning: Expert anchor ({r1},{c1}) has no legal extents")
+                continue
+            
+            phase0_obs = build_observation(grid, phase=0, selected_anchor=None)
+            # Build mask: True only at positions corresponding to legal anchors
+            phase0_mask = torch.zeros(170, dtype=torch.bool)
+            for legal_anchor_idx in sorted(legal_anchors_set):
+                phase0_mask[legal_anchor_idx] = True
             
             phase0_data.append({
                 'obs': torch.from_numpy(phase0_obs).float(),
@@ -222,22 +305,22 @@ def load_and_process_dataset(
             phase1_action_compact = extent_to_flat_idx(r1, c1, r2, c2)
             
             # build action mask for Phase-1
-            # CRITICAL FIX: Only include LEGAL extents (sum=10), not all geometrically valid extents
+            # only include LEGAL extents (sum=10), not all geometrically valid extents
             # This ensures the policy learns which extent indices correspond to legal moves
-            from fruit_box import Sum10Env
-            temp_env = Sum10Env()
-            temp_env.reset(grid=grid.copy())
             
-            # Find all legal extents for this anchor
-            max_valid_count = (10 - r1) * (17 - c1)
-            legal_extents_set = set()
-            for extent_idx in range(max_valid_count):
-                r2_test, c2_test = flat_idx_to_extent(r1, c1, extent_idx)
-                # Check if this extent sums to 10
-                if temp_env.box_sum(r1, c1, r2_test, c2_test) == 10:
-                    reward_test = temp_env.box_nonzero_count(r1, c1, r2_test, c2_test)
-                    if reward_test > 0:  # Must clear at least one cell
-                        legal_extents_set.add(extent_idx)
+            # Performance optimization: use cache for legal extents
+            phase0_action = anchor_to_flat_idx(r1, c1)
+            cache_key = (grid_hash, phase0_action)
+            if cache_key not in legal_extents_cache:
+                legal_extents_cache[cache_key] = compute_legal_extents(grid, r1, c1)
+            legal_extents_set = legal_extents_cache[cache_key]
+            
+            # Periodic cache statistics
+            if processed_steps % 10000 == 0:
+                print(f"\n  Progress: {processed_steps}/{total_steps} steps | "
+                      f"Cache: {len(legal_anchors_cache)} unique grids, "
+                      f"{len(legal_extents_cache)} (grid,anchor) pairs | "
+                      f"Examples: {len(phase0_data)} Phase-0, {len(phase1_data)} Phase-1")
             
             # Verify expert action is legal (should always be true)
             if phase1_action_compact not in legal_extents_set:
@@ -262,6 +345,11 @@ def load_and_process_dataset(
     total_examples = len(phase0_data) + len(phase1_data)
     print(f"Processed {len(phase0_data)} Phase-0 examples and {len(phase1_data)} Phase-1 examples")
     print(f"Total training examples: {total_examples}")
+    print(f"Cache statistics:")
+    print(f"  Unique grid states (legal anchors cache): {len(legal_anchors_cache)}")
+    print(f"  Unique (grid, anchor) pairs (legal extents cache): {len(legal_extents_cache)}")
+    print(f"  Cache hit rate: {100 * (1 - len(legal_anchors_cache) / max(total_examples, 1)):.1f}% (anchors), "
+          f"{100 * (1 - len(legal_extents_cache) / max(len(phase1_data), 1)):.1f}% (extents)")
     return phase0_data, phase1_data
 
 
@@ -287,14 +375,22 @@ def log_example_moves(
                 
             data_item = batch_data[i]
             mask = masks[i]
-            valid_count = mask.sum().item()
+            
+            # Handle sparse masks correctly (same as in compute_sft_loss)
+            valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [valid_count]
+            valid_count = valid_indices.numel()
             
             if valid_count == 0:
                 continue
             
-            # get predictions
-            valid_logits = logits[i][:valid_count]
-            pred_action = valid_logits.argmax().item()
+            # extract valid logits (only at positions where mask is True)
+            valid_logits = logits[i][valid_indices]  # [valid_action_count]
+            
+            # get predictions (compact index)
+            pred_action_compact = valid_logits.argmax().item()
+            pred_action_original = valid_indices[pred_action_compact].item()
+            
+            # get true action (original index)
             true_action = actions[i].item()
             
             # determine phase based on data structure
@@ -302,7 +398,7 @@ def log_example_moves(
             
             if is_phase0:
                 # Phase-0: anchor selection
-                pred_r1, pred_c1 = flat_idx_to_anchor(pred_action)
+                pred_r1, pred_c1 = flat_idx_to_anchor(pred_action_original)
                 true_r1, true_c1 = flat_idx_to_anchor(true_action)
                 
                 move_str = f"Phase-0: Predicted anchor=({pred_r1},{pred_c1}), True=({true_r1},{true_c1})"
@@ -310,7 +406,7 @@ def log_example_moves(
                 # Phase-1: extent selection
                 anchor_idx = data_item['anchor'].item()
                 anchor_r1, anchor_c1 = flat_idx_to_anchor(anchor_idx)
-                pred_r2, pred_c2 = flat_idx_to_extent(anchor_r1, anchor_c1, pred_action)
+                pred_r2, pred_c2 = flat_idx_to_extent(anchor_r1, anchor_c1, pred_action_original)
                 true_r2, true_c2 = flat_idx_to_extent(anchor_r1, anchor_c1, true_action)
                 
                 move_str = f"Phase-1: Anchor=({anchor_r1},{anchor_c1}), Predicted extent=({pred_r2},{pred_c2}), True=({true_r2},{true_c2})"
@@ -365,7 +461,13 @@ def compute_sft_loss(
         if action_pos.numel() == 0:
             # Action not in valid set (shouldn't happen, but handle gracefully)
             continue
-        action_compact = action_pos.item()
+        if action_pos.numel() > 1:
+            # Multiple matches (shouldn't happen - valid_indices should be unique)
+            # Take first match
+            action_compact = action_pos[0].item()
+        else:
+            # Single match - squeeze to scalar and get item
+            action_compact = action_pos.squeeze().item()
         
         # create cross-entropy loss
         loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
