@@ -17,7 +17,7 @@ from rl.train_sft import build_observation, flat_idx_to_anchor, flat_idx_to_exte
 
 
 def print_grid(grid: np.ndarray, title: str = "Grid"):
-    """Print grid in a readable format."""
+    """Print grid in a readable format"""
     print(f"\n{title}:")
     print("=" * 50)
     for row in grid:
@@ -37,18 +37,18 @@ def load_initial_grids_from_dataset(
     dataset_split: str = "train",
     num_grids: int = 10,
 ) -> List[np.ndarray]:
-    """Load initial grids from HuggingFace dataset."""
+    """Load initial grids from HF dataset"""
     hf_dataset = load_dataset(dataset_name, split=dataset_split)
     print(f"Loaded dataset {dataset_name} (split: {dataset_split})...")
     
-    # Group by episode_id and get unique initial grids
+    # group by episode_id and get unique initial grids
     episodes = {}
     for row in hf_dataset:
         ep_id = row["episode_id"]
         if ep_id not in episodes:
             episodes[ep_id] = row
     
-    # Extract initial grids
+    # extract initial grids
     grids = []
     for ep_id, row in list(episodes.items())[:num_grids]:
         initial_grid = np.array(row["grid"], dtype=np.uint8)
@@ -66,81 +66,72 @@ def analyze_sft_policy(
     num_moves_per_grid: int = 5,
     device: Optional[torch.device] = None,
 ):
-    """Analyze SFT policy behavior.
-    
-    Args:
-        checkpoint_path: Path to SFT checkpoint file
-        dataset_name: HuggingFace dataset name
-        dataset_split: Dataset split to use
-        num_grids: Number of initial grids to analyze
-        num_moves_per_grid: Number of moves to make per grid
-        device: PyTorch device (defaults to CUDA if available, else CPU)
-    """
+    """Run policy on dataset grids and print stats"""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Device: {device}")
     print(f"Loading checkpoint from {checkpoint_path}...")
     
-    # Load policy
+    # load policy
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
     print("Policy loaded successfully!")
     
-    # Load initial grids
+    # load initial grids
     grids = load_initial_grids_from_dataset(dataset_name, dataset_split, num_grids)
     
-    # Statistics
+    # statistics
     all_rewards = []
     all_valid = []
     reward_distribution = Counter()
     total_moves = 0
     valid_moves = 0
     
-    # Analyze each grid
+    # analyze each grid
     for grid_idx, initial_grid in enumerate(grids):
         print(f"\n{'='*70}")
         print(f"Grid {grid_idx + 1}/{len(grids)}")
         print(f"{'='*70}")
         
-        # Create environment
+        # create environment
         env = Sum10GymEnv(initial_grid=initial_grid.copy())
         wrapped_env = TwoPhaseWrapper(env, curriculum_legal_only=False, curriculum_updates=0)
         
-        # Create Sum10Env for validation
+        # create Sum10Env for validation
         validation_env = Sum10Env()
         validation_env.reset(grid=initial_grid.copy())
         
         print_grid(initial_grid, f"Initial Grid {grid_idx + 1}")
         
-        # Make moves
+        # make moves
         obs, info = wrapped_env.reset()
         current_grid = initial_grid.copy()
         
         for move_num in range(num_moves_per_grid):
             print(f"\n--- Move {move_num + 1} ---")
             
-            # Phase-0: Select anchor
+            # phase-0: select anchor
             phase0_obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
             phase0_mask = wrapped_env.get_action_mask().unsqueeze(0).to(device)  # [1, 170]
             
             with torch.no_grad():
                 logits, _ = policy(phase0_obs, phase0_mask)
-                # Use argmax for deterministic evaluation (or sample for stochastic)
+                # use argmax for deterministic evaluation (or sample for stochastic)
                 anchor_idx = logits.argmax(dim=1).item()
             
             r1, c1 = flat_idx_to_anchor(anchor_idx)
             print(f"Phase-0: Selected anchor ({r1}, {c1}) [index {anchor_idx}]")
             
-            # Step Phase-0
+            # step Phase-0
             obs, reward, terminated, truncated, info = wrapped_env.step(anchor_idx)
             
-            # Phase-1: Select extent
+            # phase-1: select extent
             phase1_obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
             phase1_mask = wrapped_env.get_action_mask()  # [valid_count]
             
-            # Pad mask to 170
+            # pad mask to 170
             padded_mask = torch.zeros(170, dtype=torch.bool)
             valid_count = phase1_mask.sum().item()
             padded_mask[:valid_count] = phase1_mask
@@ -148,7 +139,7 @@ def analyze_sft_policy(
             
             with torch.no_grad():
                 logits, _ = policy(phase1_obs, phase1_mask_padded)
-                # Extract valid logits
+                # extract valid logits
                 valid_logits = logits[0][:valid_count]
                 extent_idx = valid_logits.argmax().item()
             
@@ -156,7 +147,7 @@ def analyze_sft_policy(
             print(f"Phase-1: Selected extent ({r2}, {c2}) [index {extent_idx}]")
             print(f"Full move: ({r1}, {c1}) → ({r2}, {c2})")
             
-            # Validate move using Sum10Env
+            # validate move using Sum10Env
             step_info = validation_env.step(r1, c1, r2, c2)
             
             is_valid = step_info.valid
@@ -176,10 +167,10 @@ def analyze_sft_policy(
                 print(f"  ✗ Move is INVALID - sum={actual_sum}, expected=10")
                 break
             
-            # Step Phase-1 in wrapped env
+            # step Phase-1 in wrapped env
             obs, reward, terminated, truncated, info = wrapped_env.step(extent_idx)
             
-            # Collect statistics
+            # collect statistics
             all_rewards.append(reward_value)
             all_valid.append(is_valid)
             reward_distribution[reward_value] += 1
@@ -187,12 +178,12 @@ def analyze_sft_policy(
             if is_valid:
                 valid_moves += 1
             
-            # Check if episode ended
+            # check if episode ended
             if terminated or truncated:
                 print(f"\nEpisode ended: terminated={terminated}, truncated={truncated}")
                 break
     
-    # Print statistics
+    # print statistics
     print(f"\n{'='*70}")
     print("STATISTICS")
     print(f"{'='*70}")
@@ -213,7 +204,7 @@ def analyze_sft_policy(
             percentage = count / total_moves * 100
             print(f"  {reward_val} cells: {count} moves ({percentage:.1f}%)")
         
-        # Analyze rectangle sizes
+        # analyze rectangle sizes
         print(f"\nRectangle Size Analysis:")
         small_rects = sum(1 for r in all_rewards if r <= 2)
         medium_rects = sum(1 for r in all_rewards if 3 <= r <= 5)
@@ -232,28 +223,20 @@ def run_policy_on_random_grid(
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ):
-    """Run policy on a single random grid for specified number of moves.
-    
-    Args:
-        checkpoint_path: Path to SFT checkpoint file
-        num_moves: Number of moves to make
-        seed: Random seed for grid generation
-        device: PyTorch device (defaults to CUDA if available, else CPU)
-        verbose: If True, print each move; if False, only print summary
-    """
+    """Run policy on a random grid and print stats"""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Device: {device}")
     print(f"Loading checkpoint from {checkpoint_path}...")
     
-    # Load policy
+    # load policy
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
     print("Policy loaded successfully!")
     
-    # Generate random grid
+    # generate random grid
     initial_grid = generate_random_grid(seed=seed)
     print(f"\n{'='*70}")
     print("RANDOM GRID GENERATION")
@@ -269,14 +252,14 @@ def run_policy_on_random_grid(
     validation_env = Sum10Env()
     validation_env.reset(grid=initial_grid.copy())
     
-    # Statistics
+    # statistics
     all_rewards = []
     all_valid = []
     reward_distribution = Counter()
     total_moves = 0
     valid_moves = 0
     
-    # Run policy
+    # run policy
     obs, info = wrapped_env.reset()
     current_grid = initial_grid.copy()
     
@@ -287,21 +270,19 @@ def run_policy_on_random_grid(
     for move_num in range(num_moves):
         print(f"\n--- Move {move_num + 1}/{num_moves} ---")
         
-        # Show current grid state
+        # show current grid state
         if verbose:
             print_grid(validation_env.grid.copy(), f"Grid before move {move_num + 1}")
         
-        # Phase-0: Select anchor
-        # CRITICAL: Use legal-only anchors (anchors that have at least one legal extent)
-        # This matches the SFT training setup
+        # phase-0: use legal-only anchors (matches SFT training)
         phase0_obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
         
-        # Find all anchors that have at least one legal extent
+        # find all anchors that have at least one legal extent
         legal_anchors_set = set()
         for anchor_r1 in range(10):
             for anchor_c1 in range(17):
                 anchor_idx = flat_idx_to_anchor(anchor_r1 * 17 + anchor_c1)
-                # Check if this anchor has any legal extents
+                # check if this anchor has any legal extents
                 max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
                 has_legal = False
                 for extent_idx in range(max_valid_count):
@@ -314,7 +295,7 @@ def run_policy_on_random_grid(
                 if has_legal:
                     legal_anchors_set.add(anchor_r1 * 17 + anchor_c1)
         
-        # Build mask: True only at positions corresponding to legal anchors
+        # build mask: True only at positions corresponding to legal anchors
         phase0_mask = torch.zeros(170, dtype=torch.bool)
         for legal_anchor_idx in sorted(legal_anchors_set):
             phase0_mask[legal_anchor_idx] = True
@@ -326,12 +307,12 @@ def run_policy_on_random_grid(
         
         with torch.no_grad():
             logits, _ = policy(phase0_obs, phase0_mask)
-            # Extract logits only at legal anchor positions
+            # extract logits only at legal anchor positions
             legal_anchor_indices = torch.nonzero(phase0_mask[0], as_tuple=False).squeeze(-1)
             valid_logits = logits[0][legal_anchor_indices]
             anchor_idx_compact = valid_logits.argmax().item()
             anchor_idx = legal_anchor_indices[anchor_idx_compact].item()
-            # Also get top-3 anchors for debugging
+            # also get top-3 anchors for debugging
             top3_anchors_compact = valid_logits.topk(min(3, valid_logits.numel()))
             top3_anchors = [(legal_anchor_indices[idx].item(), valid_logits[idx].item()) for idx in top3_anchors_compact.indices]
         
@@ -340,17 +321,14 @@ def run_policy_on_random_grid(
         if verbose:
             print(f"  Top-3 anchor logits: {[(flat_idx_to_anchor(idx), logit) for idx, logit in top3_anchors]}")
         
-        # Step Phase-0
+        # step Phase-0
         obs, reward, terminated, truncated, info = wrapped_env.step(anchor_idx)
         
-        # Phase-1: Select extent
+        # phase-1: use legal-only mask (only extents that sum to 10, matches SFT training)
         phase1_obs = obs.unsqueeze(0).to(device)  # [1, 4, 10, 17]
-        
-        # CRITICAL: Use legal-only mask (only extents that sum to 10)
-        # This matches the SFT training setup
         phase1_mask_legal = wrapped_env.get_legal_only_mask()  # [valid_count] - only legal extents
         
-        # Pad mask to 170, preserving sparse structure
+        # pad mask to 170, preserving sparse structure
         padded_mask = torch.zeros(170, dtype=torch.bool)
         valid_indices = torch.nonzero(phase1_mask_legal, as_tuple=False).squeeze(-1)
         if valid_indices.numel() > 0:
@@ -359,16 +337,16 @@ def run_policy_on_random_grid(
         
         with torch.no_grad():
             logits, _ = policy(phase1_obs, phase1_mask_padded)
-            # Extract logits only at legal positions
+            # extract logits only at legal positions
             if valid_indices.numel() > 0:
                 valid_count = valid_indices.numel()
                 valid_logits = logits[0][valid_indices]
                 extent_idx_compact = valid_logits.argmax().item()
                 extent_idx = valid_indices[extent_idx_compact].item()
-                # Also get top-3 extents for debugging
+                # also get top-3 extents for debugging
                 top3_extents = valid_logits.topk(min(3, valid_count))
             else:
-                # No legal moves available
+                # no legal moves available
                 print("  No legal moves available!")
                 break
         
@@ -376,7 +354,7 @@ def run_policy_on_random_grid(
         print(f"Phase-1: Selected extent ({r2}, {c2}) [index {extent_idx}/{valid_count-1}]")
         print(f"Full move: Rectangle from ({r1}, {c1}) to ({r2}, {c2})")
         
-        # Calculate rectangle size
+        # calculate rectangle size
         rect_width = r2 - r1 + 1
         rect_height = c2 - c1 + 1
         rect_size = rect_width * rect_height
@@ -404,7 +382,7 @@ def run_policy_on_random_grid(
                 print_grid(current_grid, f"Grid after move {move_num + 1}")
         else:
             print(f"  ✗ Move is INVALID - sum={actual_sum}, expected=10")
-            # Check what legal moves exist
+            # check what legal moves exist
             legal_moves = validation_env.enumerate_legal()
             print(f"  Legal moves available: {len(legal_moves)}")
             if len(legal_moves) > 0 and verbose:
@@ -412,7 +390,7 @@ def run_policy_on_random_grid(
                 for (lr1, lc1, lr2, lc2), lreward in legal_moves[:5]:
                     print(f"    ({lr1},{lc1})→({lr2},{lc2}): sum=10, reward={lreward}")
         
-        # Step Phase-1 in wrapped env
+        # step Phase-1 in wrapped env
         obs, reward, terminated, truncated, info = wrapped_env.step(extent_idx)
         
         # Collect statistics
@@ -423,7 +401,7 @@ def run_policy_on_random_grid(
         if is_valid:
             valid_moves += 1
         
-        # Check if episode ended
+        # check if episode ended
         if terminated or truncated:
             print(f"\nEpisode ended: terminated={terminated}, truncated={truncated}")
             if terminated:
@@ -431,14 +409,14 @@ def run_policy_on_random_grid(
                 print(f"  Reason: No legal moves available (checked {len(legal_moves)} possible moves)")
             break
     
-    # Print final grid
+    # print final grid
     final_grid = validation_env.grid.copy()
     print(f"\n{'='*70}")
     print("FINAL GRID STATE")
     print(f"{'='*70}")
     print_grid(final_grid, "Final Grid")
     
-    # Print statistics
+    # print statistics
     print(f"\n{'='*70}")
     print("STATISTICS")
     print(f"{'='*70}")
@@ -459,7 +437,7 @@ def run_policy_on_random_grid(
             percentage = count / total_moves * 100
             print(f"  {reward_val} cells: {count} moves ({percentage:.1f}%)")
         
-        # Analyze rectangle sizes
+        # analyze rectangle sizes
         print(f"\nRectangle Size Analysis:")
         small_rects = sum(1 for r in all_rewards if r <= 2)
         medium_rects = sum(1 for r in all_rewards if 3 <= r <= 5)
@@ -468,7 +446,7 @@ def run_policy_on_random_grid(
         print(f"  Medium (3-5 cells): {medium_rects} ({medium_rects/len(all_rewards)*100:.1f}%)")
         print(f"  Large (≥6 cells): {large_rects} ({large_rects/len(all_rewards)*100:.1f}%)")
         
-        # Total cells cleared
+        # total cells cleared
         total_cells_cleared = sum(all_rewards)
         print(f"\nTotal cells cleared: {total_cells_cleared} cells")
         print(f"Average cells cleared per valid move: {total_cells_cleared / max(valid_moves, 1):.2f} cells")
@@ -538,7 +516,7 @@ def main():
         device = torch.device(args.device)
     
     if args.random_grid:
-        # Run on random grid
+        # run on random grid
         run_policy_on_random_grid(
             checkpoint_path=args.checkpoint,
             num_moves=args.num_moves,
@@ -547,7 +525,7 @@ def main():
             verbose=args.verbose,
         )
     else:
-        # Run on dataset grids
+        # run on dataset grids
         analyze_sft_policy(
             checkpoint_path=args.checkpoint,
             dataset_name=args.dataset,

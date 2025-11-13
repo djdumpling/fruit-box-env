@@ -1,7 +1,6 @@
 """
-python rl/train_grpo.py --seed 42
 
-python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch100.pt
+python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch30.pt
 
 python rl/eval.py \
   --checkpoint checkpoints/policy_final.pt \
@@ -36,47 +35,47 @@ from fruit_box import Sum10Env
 
 @dataclass
 class Config:
-    """Training configuration.
+    """Training config for GRPO fine-tuning from SFT policy
     
-    Hyperparameters optimized for SFT-pretrained initialization (98.7% accuracy).
-    Key changes: lower LRs, higher entropy/exploration, reduced training length.
+    SFT policy already hits 100% legality, so we're just tweaking it to get better rewards.
+    Lower LRs, less exploration, tighter clipping, fewer updates.
     """
-    # Data collection
-    num_envs: int = 16  # Keep: parallel envs help regardless of initialization
-    rollout_steps: int = 128  # Keep: standard value
-    batch_size: int = 512  # Keep: good balance
-    epochs: int = 4  # Keep: standard PPO epochs
+    # data collection
+    num_envs: int = 16
+    rollout_steps: int = 128
+    batch_size: int = 512
+    epochs: int = 4
     
-    # Phase-0 (PPO) hyperparameters
-    phase0_lr: float = 3e-5  # INCREASED from 2e-5: balance between stability and learning speed
-    phase0_clip_eps: float = 0.12  # Keep: conservative clipping prevents large policy changes
-    phase0_target_kl: float = 0.008  # LOOSENED from 0.005: allow more updates while still constraining
-    phase0_value_coef: float = 0.8  # Keep: standard value
+    # phase-0 (PPO) hyperparameters
+    phase0_lr: float = 1.5e-5  # was 3e-5, lowered for fine-tuning
+    phase0_clip_eps: float = 0.08  # was 0.12, tighter to avoid breaking the good policy
+    phase0_target_kl: float = 0.005  # was 0.008, keep updates small
+    phase0_value_coef: float = 0.8
     
-    # Phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 5e-5  # INCREASED from 3e-5: need faster learning, maintain 1.67x ratio with Phase-0
-    phase1_clip_eps: float = 0.2  # INCREASED from 0.15: allow more policy change while still clipping
-    phase1_target_ratio: float = 2.5  # LOOSENED from 1.2: allow necessary updates, prevent only extreme spikes (7+)
-    grpo_k: int = 24  # Keep: more candidates for exploration
-    frozen_refresh_interval: int = 100  # REDUCED from 200: refresh more often to maintain diversity
-    grpo_temperature: float = 1.8  # REDUCED from 2.0: balance exploration without too much randomness
-    min_reward_std: float = 0.01  # Keep: minimum diversity threshold
+    # phase-1 (GRPO) hyperparameters
+    phase1_lr: float = 2.5e-5  # was 5e-5, same reasoning as phase0
+    phase1_clip_eps: float = 0.15  # was 0.2
+    phase1_target_ratio: float = 2.0  # was 2.5
+    grpo_k: int = 20  # was 24, don't need as much exploration
+    frozen_refresh_interval: int = 100
+    grpo_temperature: float = 1.5  # was 1.8, policy is already good
+    min_reward_std: float = 0.01
     
-    # Shared hyperparameters
-    max_updates: int = 2500  # Keep: starting from good baseline
-    gamma: float = 0.995  # Keep: discount factor unchanged
-    gae_lambda: float = 0.95  # Keep: GAE lambda unchanged
-    entropy_coef: float = 0.05  # INCREASED from 0.03: encourage exploration, entropy too low (1→1.4→decreasing)
-    entropy_target: float = 0.5  # Keep: target minimum entropy
-    entropy_penalty_coef: float = 0.2  # REDUCED from 0.3: less aggressive penalty, allow entropy to increase naturally
-    grad_clip: float = 1.0  # Keep: standard gradient clipping
-    lr_warmup_steps: int = 100  # INCREASED from 50: more gradual adaptation for pretrained weights
+    # shared hyperparameters
+    max_updates: int = 1500  # was 2500, should converge faster
+    gamma: float = 0.995
+    gae_lambda: float = 0.95
+    entropy_coef: float = 0.02  # was 0.05, policy already knows what to do
+    entropy_target: float = 0.3  # was 0.5, lower is fine since it's already tuned
+    entropy_penalty_coef: float = 0.15  # was 0.2
+    grad_clip: float = 1.0
+    lr_warmup_steps: int = 50  # was 100, policy is already good so less warmup needed
     
-    # Curriculum learning
-    curriculum_updates: int = 0  # DISABLED: SFT policy already knows legal moves at 98.7% accuracy, curriculum constrains exploration
-    illegal_penalty: float = -0.1  # Keep: penalty for illegal moves
+    # curriculum learning
+    curriculum_updates: int = 0  # disabled, SFT already handles legal moves
+    illegal_penalty: float = -0.1
     
-    # Other
+    # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 500
@@ -86,14 +85,14 @@ class Config:
 
 
 class RolloutBuffer:
-    """Buffer for storing rollout data."""
+    """Buffer for storing rollout data"""
     
     def __init__(self, rollout_steps: int, num_envs: int, obs_shape: Tuple[int, ...], device: str):
         self.rollout_steps = rollout_steps
         self.num_envs = num_envs
         self.device = device
         
-        # Phase-0 data (anchor selection)
+        # phase-0 data (anchor selection)
         self.phase0_obs = []
         self.phase0_actions = []
         self.phase0_logprobs = []
@@ -103,7 +102,7 @@ class RolloutBuffer:
         self.phase0_masks = []
         self.phase0_env_indices = []  # track which env each transition belongs to
         
-        # Phase-1 data (extent selection)
+        # phase-1 data (extent selection)
         self.phase1_obs = []
         self.phase1_anchors = []
         self.phase1_actions = []  # list of [K] arrays
@@ -124,7 +123,7 @@ class RolloutBuffer:
         mask: torch.Tensor,
         env_idx: int,
     ):
-        """Add Phase-0 transition."""
+        """Add Phase-0 transition"""
         # detach to avoid double backward
         self.phase0_obs.append(obs.detach().cpu())
         self.phase0_actions.append(action.detach().cpu())
@@ -149,7 +148,7 @@ class RolloutBuffer:
         mask: torch.Tensor,
         done: bool,
     ):
-        """Add Phase-1 transition."""
+        """Add Phase-1 transition"""
         # detach to avoid double backward
         self.phase1_obs.append(obs.detach().cpu())
         self.phase1_anchors.append(anchor.detach().cpu())
@@ -164,7 +163,7 @@ class RolloutBuffer:
     
     
     def get_phase0_data(self) -> Dict[str, torch.Tensor]:
-        """Get Phase-0 data as tensors."""
+        """Get Phase-0 data as tensors"""
         return {
             "obs": torch.stack(self.phase0_obs, dim=0).to(self.device),
             "actions": torch.stack(self.phase0_actions, dim=0).to(self.device),
@@ -176,7 +175,7 @@ class RolloutBuffer:
         }
     
     def get_phase1_data(self) -> Dict:
-        """Get Phase-1 data."""
+        """Get Phase-1 data"""
         # phase-1 data has variable K and variable mask sizes, so we'll handle it specially
         # pad masks to max size (170) for consistent stacking
         max_mask_size = 170
@@ -205,7 +204,7 @@ class RolloutBuffer:
         }
     
     def clear(self):
-        """Clear buffer."""
+        """Clear buffer"""
         self.phase0_obs.clear()
         self.phase0_actions.clear()
         self.phase0_logprobs.clear()
@@ -237,8 +236,8 @@ def visualize_action(
     reward: float,
     total_reward: float,
 ):
-    """Visualize the grid with the selected rectangle highlighted."""
-    # Extract rectangle values
+    """Visualize the grid with the selected rectangle highlighted"""
+    # extract rectangle values
     rect_values = []
     rect_sum = 0
     for r in range(r1, r2 + 1):
@@ -249,12 +248,12 @@ def visualize_action(
     
     print(f"Turn {turn}: ({r1},{c1})→({r2},{c2}) | Reward: {reward:.1f} | Total: {total_reward:.1f} | Sum: {rect_sum}")
     
-    # Print grid with rectangle highlighted
+    # print grid with rectangle highlighted
     for r in range(10):
         row_str = []
         for c in range(17):
             val = grid[r, c]
-            # Highlight rectangle cells
+            # highlight rectangle cells
             if r1 <= r <= r2 and c1 <= c <= c2:
                 row_str.append(f"[{val:2d}]")
             else:
@@ -264,7 +263,7 @@ def visualize_action(
 
 
 def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
-    """Create environment."""
+    """Create environment"""
     env = Sum10GymEnv(initial_grid=initial_grid)
     env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
     return env
@@ -280,7 +279,7 @@ def collect_rollouts(
     render_env_idx: int = 0,
     current_update: Optional[int] = None,
 ):
-    """Collect rollouts from environments."""
+    """Collect rollouts from environments"""
     if frozen_policy is None:
         frozen_policy = policy
     
@@ -541,7 +540,7 @@ def collect_rollouts(
         dones = torch.tensor(dones_list, device=obs.device, dtype=torch.bool)
         
         # update rewards for Phase-1 completions
-        # Phase-1 rewards go to the corresponding Phase-0 transition
+        # phase-1 rewards go to the corresponding Phase-0 transition
         if phase1_mask.any():
             phase1_indices = torch.where(phase1_mask)[0]
             for i, env_idx in enumerate(phase1_indices):
@@ -563,7 +562,7 @@ def collect_rollouts(
 
 
 def train(config: Config, use_wandb: bool = True):
-    """Main training loop.
+    """Main training loop
     
     Args:
         config: Training configuration
@@ -639,11 +638,11 @@ def train(config: Config, use_wandb: bool = True):
         print(f"Loading checkpoint from {config.load_checkpoint}...")
         checkpoint = torch.load(config.load_checkpoint, map_location=device)
         
-        # Load checkpoint (includes both policy and value heads)
+        # load checkpoint (includes both policy and value heads)
         policy.load_state_dict(checkpoint)
         
-        # Re-initialize value head: SFT value estimates are wrong for RL returns
-        # Keep policy head weights from SFT, but reset value head
+        # re-initialize value head: SFT value estimates are wrong for RL returns
+        # keep policy head weights from SFT, but reset value head
         print("Re-initializing value head (SFT value estimates don't match RL returns)...")
         for param in policy.value_head.parameters():
             if len(param.shape) >= 2:
@@ -663,7 +662,7 @@ def train(config: Config, use_wandb: bool = True):
     
     # learning rate warmup helper function
     def get_lr_multiplier(step: int, warmup_steps: int) -> float:
-        """Get learning rate multiplier for warmup."""
+        """Get learning rate multiplier for warmup"""
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         return 1.0
@@ -803,7 +802,7 @@ def train(config: Config, use_wandb: bool = True):
                 loss.backward()
                 total_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
                 
-                # Log gradient norm if close to clipping threshold (indicates potential instability)
+                # log gradient norm if close to clipping threshold (indicates potential instability)
                 if use_wandb and total_norm > config.grad_clip * 0.9:
                     wandb.log({"debug/grad_norm": total_norm.item()}, step=update, commit=False)
                 
@@ -903,10 +902,10 @@ def train(config: Config, use_wandb: bool = True):
                         config.phase1_clip_eps,
                     )
                     
-                    # Check mean ratio constraint for Phase-1 (prevent catastrophic policy changes)
+                    # check mean ratio constraint for Phase-1 (prevent catastrophic policy changes)
                     mean_ratio = info.get('mean_ratio', 1.0)
                     if mean_ratio > config.phase1_target_ratio:
-                        # Skip update if mean ratio too large (policy changing too fast)
+                        # skip update if mean ratio too large (policy changing too fast)
                         if use_wandb:
                             wandb.log({
                                 "debug/phase1_ratio_skip": 1.0,
@@ -918,7 +917,7 @@ def train(config: Config, use_wandb: bool = True):
                     loss.backward()
                     total_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
                     
-                    # Log gradient norm if close to clipping threshold (indicates potential instability)
+                    # log gradient norm if close to clipping threshold (indicates potential instability)
                     if use_wandb and total_norm > config.grad_clip * 0.9:
                         wandb.log({"debug/phase1_grad_norm": total_norm.item()}, step=update, commit=False)
                     
