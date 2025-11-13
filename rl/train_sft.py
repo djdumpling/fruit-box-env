@@ -222,11 +222,35 @@ def load_and_process_dataset(
             phase1_action_compact = extent_to_flat_idx(r1, c1, r2, c2)
             
             # build action mask for Phase-1
-            # pad to max size (170) with True at first valid_count positions
-            # this matches the format used in train_grpo.py
-            valid_count = (10 - r1) * (17 - c1)
+            # CRITICAL FIX: Only include LEGAL extents (sum=10), not all geometrically valid extents
+            # This ensures the policy learns which extent indices correspond to legal moves
+            from fruit_box import Sum10Env
+            temp_env = Sum10Env()
+            temp_env.reset(grid=grid.copy())
+            
+            # Find all legal extents for this anchor
+            max_valid_count = (10 - r1) * (17 - c1)
+            legal_extents_set = set()
+            for extent_idx in range(max_valid_count):
+                r2_test, c2_test = flat_idx_to_extent(r1, c1, extent_idx)
+                # Check if this extent sums to 10
+                if temp_env.box_sum(r1, c1, r2_test, c2_test) == 10:
+                    reward_test = temp_env.box_nonzero_count(r1, c1, r2_test, c2_test)
+                    if reward_test > 0:  # Must clear at least one cell
+                        legal_extents_set.add(extent_idx)
+            
+            # Verify expert action is legal (should always be true)
+            if phase1_action_compact not in legal_extents_set:
+                # Skip this example if expert action is not legal (shouldn't happen, but handle gracefully)
+                print(f"Warning: Expert extent {phase1_action_compact} not in legal set for anchor ({r1},{c1})")
+                continue
+            
+            # Build mask: True only at positions corresponding to legal extents
+            # Keep original extent indices, but mask out illegal ones
             phase1_mask = torch.zeros(170, dtype=torch.bool)
-            phase1_mask[:valid_count] = True
+            for legal_idx in sorted(legal_extents_set):
+                if legal_idx < 170:  # Safety check
+                    phase1_mask[legal_idx] = True
             
             phase1_data.append({
                 'obs': torch.from_numpy(phase1_obs).float(),
@@ -318,34 +342,39 @@ def compute_sft_loss(
     logits, _ = policy(obs, masks)  # [batch_size, 170]
     
     # compute loss for each sample
-    # masks are padded to 170, with True at first valid_count positions
+    # masks may be sparse (True only at legal extent indices) or contiguous
     losses = []
     correct = 0
     total = 0
     
     for b in range(obs.size(0)):
         mask = masks[b]  # [170]
-        valid_count = mask.sum().item()
+        valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [valid_count]
+        valid_count = valid_indices.numel()
         
         if valid_count == 0:
             continue
         
-        # extract valid logits (first valid_count positions)
-        valid_logits = logits[b][:valid_count]  # [valid_action_count]
+        # extract valid logits (only at positions where mask is True)
+        valid_logits = logits[b][valid_indices]  # [valid_action_count]
         action = actions[b].item()
         
-        # ensure action is within valid range
-        if action >= valid_count:
-            # skip invalid actions (shouldn't happen, but handle gracefully)
+        # Map action index to position in valid_indices
+        # action is the original extent index, need to find its position in valid_indices
+        action_pos = (valid_indices == action).nonzero(as_tuple=False)
+        if action_pos.numel() == 0:
+            # Action not in valid set (shouldn't happen, but handle gracefully)
             continue
+        action_compact = action_pos.item()
         
         # create cross-entropy loss
-        loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action], device=obs.device))
+        loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
         losses.append(loss)
         
         # compute accuracy
-        pred_action = valid_logits.argmax().item()
-        if pred_action == action:
+        pred_action_compact = valid_logits.argmax().item()
+        pred_action_original = valid_indices[pred_action_compact].item()
+        if pred_action_original == action:
             correct += 1
         total += 1
     
