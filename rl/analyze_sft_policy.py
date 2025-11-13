@@ -1,13 +1,3 @@
-"""Analyze SFT policy behavior by loading checkpoint and evaluating on dataset grids.
-
-This script:
-1. Loads an SFT checkpoint
-2. Loads initial grids from HuggingFace dataset
-3. Runs policy through two-phase selection (anchor then extent)
-4. Prints grid and selected move
-5. Validates move using Sum10Env
-6. Collects statistics about reward distribution
-"""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,14 +26,7 @@ def print_grid(grid: np.ndarray, title: str = "Grid"):
 
 
 def generate_random_grid(seed: Optional[int] = None) -> np.ndarray:
-    """Generate a random 10x17 grid with digits 1-9.
-    
-    Args:
-        seed: Random seed for reproducibility
-        
-    Returns:
-        Random grid of shape (10, 17) with values 1-9
-    """
+    # unconstrained that sum is multiple of 10, but shouldn't matter for tests
     rng = np.random.default_rng(seed)
     grid = rng.integers(1, 10, size=(10, 17), dtype=np.uint8)
     return grid
