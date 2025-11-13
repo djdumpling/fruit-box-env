@@ -28,7 +28,7 @@ import wandb
 from rl.envs.sum10_env import Sum10GymEnv
 from rl.envs.split_wrapper import TwoPhaseWrapper
 from rl.models.policy import CNNPolicy
-from rl.algo.ppo import compute_gae, compute_ppo_loss
+from rl.algo.ppo import compute_gae, compute_ppo_loss, map_action_to_valid_space
 from rl.algo.grpo import compute_grpo_loss, simulate_action_reward
 from fruit_box import Sum10Env
 
@@ -845,8 +845,11 @@ def train(config: Config, use_wandb: bool = True):
                     for b in range(batch_obs.size(0)):
                         valid_mask = batch_masks[b]
                         valid_logits = logits[b][valid_mask]
+                        # Map action from full action space to valid action space
+                        action_idx = batch_actions[b].item()
+                        mapped_action_idx = map_action_to_valid_space(action_idx, valid_mask)
                         dist = torch.distributions.Categorical(logits=valid_logits)
-                        new_logprobs_batch.append(dist.log_prob(batch_actions[b]))
+                        new_logprobs_batch.append(dist.log_prob(torch.tensor(mapped_action_idx, device=batch_actions.device)))
                     new_logprobs_batch = torch.stack(new_logprobs_batch)
                     
                     kl_div = (batch_old_logprobs - new_logprobs_batch).mean().item()

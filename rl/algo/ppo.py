@@ -4,6 +4,44 @@ import torch.nn as nn
 from typing import Tuple, Dict
 
 
+def map_action_to_valid_space(action: int, valid_mask: torch.Tensor) -> int:
+    """Map an action index from full action space to valid action space.
+    
+    Args:
+        action: Action index in full action space (0-169)
+        valid_mask: Boolean mask indicating valid actions [action_dim]
+    
+    Returns:
+        Index in valid action space (0 to valid_action_count-1)
+    
+    Raises:
+        ValueError: If action is invalid and no valid actions exist
+    """
+    # Get indices where mask is True
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False)  # [valid_action_count, 1]
+    if valid_indices.dim() > 1:
+        valid_indices = valid_indices.squeeze(-1)  # [valid_action_count]
+    
+    # Handle case where valid_indices might be 0-d or empty
+    if valid_indices.numel() == 0:
+        raise ValueError(f"No valid actions exist in mask")
+    
+    # Check if action is valid
+    if action >= valid_mask.size(0) or not valid_mask[action]:
+        # Action is invalid - this shouldn't happen, but handle gracefully
+        return 0  # Use first valid action as fallback
+    
+    # Find the index in valid_indices that matches action
+    # valid_indices is a 1D tensor, so we can directly compare
+    matches = (valid_indices == action).nonzero(as_tuple=False)
+    if matches.numel() == 0:
+        # Action was valid when sampled but mask changed - use first valid action
+        return 0
+    else:
+        # matches is a 1D tensor with indices into valid_indices
+        return matches.item() if matches.dim() == 0 else matches[0].item()
+
+
 def compute_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
@@ -102,9 +140,14 @@ def compute_ppo_loss(
         valid_mask = action_mask[b]  # [action_dim]
         valid_logits = logits[b][valid_mask]  # [valid_action_count]
         
+        # Map action from full action space to valid action space
+        # actions[b] is an index into the full action space (0-169)
+        action_idx = actions[b].item()
+        mapped_action_idx = map_action_to_valid_space(action_idx, valid_mask)
+        
         dist = torch.distributions.Categorical(logits=valid_logits)
-        # actions[b] is index into valid action space
-        new_logprobs.append(dist.log_prob(actions[b]))
+        # mapped_action_idx is now index into valid action space
+        new_logprobs.append(dist.log_prob(torch.tensor(mapped_action_idx, device=actions.device)))
         entropies.append(dist.entropy())
     
     new_logprobs = torch.stack(new_logprobs)  # [batch_size]
