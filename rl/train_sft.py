@@ -51,6 +51,10 @@ class Config:
     lr: float = 1e-4
     weight_decay: float = 1e-5
     
+    # negative examples (for learning legality)
+    include_negative_examples: bool = True
+    negative_example_ratio: float = 0.5  # ratio of negative to positive examples
+    
     # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
@@ -168,12 +172,33 @@ def compute_legal_extents(grid: np.ndarray, r1: int, c1: int) -> set:
     return legal_extents_set
 
 
+def compute_illegal_anchors(grid: np.ndarray, legal_anchors_set: set) -> set:
+    """Find all anchors that DON'T have any legal extents"""
+    all_anchors = set(range(170))
+    illegal_anchors_set = all_anchors - legal_anchors_set
+    return illegal_anchors_set
+
+
+def compute_illegal_extents(grid: np.ndarray, r1: int, c1: int, legal_extents_set: set) -> set:
+    """Find all geometrically valid extents that DON'T sum to 10"""
+    max_valid_count = (10 - r1) * (17 - c1)
+    all_extents = set(range(max_valid_count))
+    illegal_extents_set = all_extents - legal_extents_set
+    return illegal_extents_set
+
+
 def load_and_process_dataset(
     dataset_name: str,
     dataset_split: str,
     seed: Optional[int] = None,
+    include_negative_examples: bool = True,
+    negative_example_ratio: float = 0.5,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Load dataset and convert to Phase-0/Phase-1 examples"""
+    """Load dataset and convert to Phase-0/Phase-1 examples
+    
+    If include_negative_examples=True, generates negative examples (illegal anchors/extents)
+    to teach the policy which actions are invalid.
+    """
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -271,16 +296,42 @@ def load_and_process_dataset(
                 continue
             
             phase0_obs = build_observation(grid, phase=0, selected_anchor=None)
-            # build mask: True only at positions corresponding to legal anchors
+            
+            # build mask: include all anchors if negative examples enabled, otherwise only legal
             phase0_mask = torch.zeros(170, dtype=torch.bool)
-            for legal_anchor_idx in sorted(legal_anchors_set):
-                phase0_mask[legal_anchor_idx] = True
+            if include_negative_examples:
+                # include all anchors (legal + illegal) so policy can learn to avoid illegal ones
+                phase0_mask.fill_(True)
+            else:
+                # only include legal anchors (old behavior)
+                for legal_anchor_idx in sorted(legal_anchors_set):
+                    phase0_mask[legal_anchor_idx] = True
             
             phase0_data.append({
                 'obs': torch.from_numpy(phase0_obs).float(),
                 'action': torch.tensor(phase0_action, dtype=torch.long),
                 'mask': phase0_mask,
+                'is_positive': True,  # mark as positive example
             })
+            
+            # generate negative examples for Phase-0 if enabled
+            if include_negative_examples:
+                illegal_anchors_set = compute_illegal_anchors(grid, legal_anchors_set)
+                if illegal_anchors_set:
+                    # sample negative anchors according to ratio (probabilistic: generate with probability = ratio)
+                    num_negative = 1 if random.random() < negative_example_ratio else 0
+                    if num_negative > 0:
+                        sampled_illegal = random.sample(list(illegal_anchors_set), min(num_negative, len(illegal_anchors_set)))
+                    else:
+                        sampled_illegal = []
+                    
+                    for illegal_anchor_idx in sampled_illegal:
+                        phase0_data.append({
+                            'obs': torch.from_numpy(phase0_obs).float(),  # same observation
+                            'action': torch.tensor(illegal_anchor_idx, dtype=torch.long),  # illegal anchor
+                            'mask': phase0_mask,  # all anchors included
+                            'is_positive': False,  # mark as negative example
+                        })
             
             # phase-1: select extent (r2, c2) given anchor (r1, c1)
             phase1_obs = build_observation(grid, phase=1, selected_anchor=(r1, c1))
@@ -307,22 +358,55 @@ def load_and_process_dataset(
                 print(f"Warning: Expert extent {phase1_action_compact} not in legal set for anchor ({r1},{c1})")
                 continue
             
-            # build mask: True only at positions corresponding to legal extents
-            # keep original extent indices, but mask out illegal ones
+            # build mask: include all geometrically valid extents if negative examples enabled
+            max_valid_count = (10 - r1) * (17 - c1)
             phase1_mask = torch.zeros(170, dtype=torch.bool)
-            for legal_idx in sorted(legal_extents_set):
-                if legal_idx < 170:  # Safety check
-                    phase1_mask[legal_idx] = True
+            if include_negative_examples:
+                # include all geometrically valid extents (legal + illegal) so policy can learn
+                for idx in range(min(max_valid_count, 170)):
+                    phase1_mask[idx] = True
+            else:
+                # only include legal extents (old behavior)
+                for legal_idx in sorted(legal_extents_set):
+                    if legal_idx < 170:  # Safety check
+                        phase1_mask[legal_idx] = True
             
             phase1_data.append({
                 'obs': torch.from_numpy(phase1_obs).float(),
                 'action': torch.tensor(phase1_action_compact, dtype=torch.long),
                 'mask': phase1_mask,
                 'anchor': torch.tensor(phase0_action, dtype=torch.long),
+                'is_positive': True,  # mark as positive example
             })
+            
+            # generate negative examples for Phase-1 if enabled
+            if include_negative_examples:
+                illegal_extents_set = compute_illegal_extents(grid, r1, c1, legal_extents_set)
+                if illegal_extents_set:
+                    # sample negative extents according to ratio (probabilistic: generate with probability = ratio)
+                    num_negative = 1 if random.random() < negative_example_ratio else 0
+                    if num_negative > 0:
+                        sampled_illegal = random.sample(list(illegal_extents_set), min(num_negative, len(illegal_extents_set)))
+                    else:
+                        sampled_illegal = []
+                    
+                    for illegal_extent_idx in sampled_illegal:
+                        phase1_data.append({
+                            'obs': torch.from_numpy(phase1_obs).float(),  # same observation
+                            'action': torch.tensor(illegal_extent_idx, dtype=torch.long),  # illegal extent
+                            'mask': phase1_mask,  # all extents included
+                            'anchor': torch.tensor(phase0_action, dtype=torch.long),
+                            'is_positive': False,  # mark as negative example
+                        })
     
     total_examples = len(phase0_data) + len(phase1_data)
-    print(f"Processed {len(phase0_data)} Phase-0 examples and {len(phase1_data)} Phase-1 examples")
+    phase0_positive = sum(1 for d in phase0_data if d.get('is_positive', True))
+    phase0_negative = len(phase0_data) - phase0_positive
+    phase1_positive = sum(1 for d in phase1_data if d.get('is_positive', True))
+    phase1_negative = len(phase1_data) - phase1_positive
+    
+    print(f"Processed {len(phase0_data)} Phase-0 examples ({phase0_positive} positive, {phase0_negative} negative)")
+    print(f"Processed {len(phase1_data)} Phase-1 examples ({phase1_positive} positive, {phase1_negative} negative)")
     print(f"Total training examples: {total_examples}")
     print(f"Cache statistics:")
     print(f"  Unique grid states (legal anchors cache): {len(legal_anchors_cache)}")
@@ -401,8 +485,13 @@ def compute_sft_loss(
     obs: torch.Tensor,
     actions: torch.Tensor,
     masks: torch.Tensor,
+    is_positive: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict]:
-    """Compute SFT loss. Masks can be sparse (only legal actions) or contiguous"""
+    """Compute SFT loss. Masks can be sparse (only legal actions) or contiguous
+    
+    For positive examples: model should predict the correct (legal) action
+    For negative examples: model should learn to avoid the illegal action (same loss, different accuracy metric)
+    """
     logits, _ = policy(obs, masks)  # [batch_size, 170]
     
     # compute loss for each sample
@@ -410,10 +499,15 @@ def compute_sft_loss(
     losses = []
     correct = 0
     total = 0
+    negative_correct = 0  # for negative examples: correct = model does NOT predict illegal action
+    negative_total = 0
     
     for b in range(obs.size(0)):
         mask = masks[b]  # [170]
         valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [valid_count]
+        # ensure valid_indices is 1D (squeeze might make it 0D if single element)
+        if valid_indices.dim() == 0:
+            valid_indices = valid_indices.unsqueeze(0)
         valid_count = valid_indices.numel()
         
         if valid_count == 0:
@@ -437,28 +531,45 @@ def compute_sft_loss(
             # single match - squeeze to scalar and get item
             action_compact = action_pos.squeeze().item()
         
-        # create cross-entropy loss
+        # create cross-entropy loss (same for positive and negative examples)
+        # for negative examples, this teaches the model to assign low probability to illegal actions
         loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
         losses.append(loss)
         
         # compute accuracy
         pred_action_compact = valid_logits.argmax().item()
         pred_action_original = valid_indices[pred_action_compact].item()
-        if pred_action_original == action:
-            correct += 1
-        total += 1
+        
+        # check if this is a negative example
+        is_neg = is_positive is not None and not is_positive[b].item() if is_positive is not None else False
+        
+        if is_neg:
+            # for negative examples: correct = model does NOT predict the illegal action
+            negative_total += 1
+            if pred_action_original != action:
+                negative_correct += 1
+        else:
+            # for positive examples: correct = model predicts the correct legal action
+            total += 1
+            if pred_action_original == action:
+                correct += 1
     
     if len(losses) == 0:
         # return zero loss if no valid samples
         loss = torch.tensor(0.0, device=obs.device, requires_grad=True)
         accuracy = 0.0
+        negative_accuracy = 0.0
     else:
         loss = torch.stack(losses).mean()
         accuracy = correct / total if total > 0 else 0.0
+        negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
     
     info = {
         'loss': loss.item(),
         'accuracy': accuracy,
+        'negative_accuracy': negative_accuracy,
+        'positive_count': total,
+        'negative_count': negative_total,
     }
     
     return loss, info
@@ -503,6 +614,8 @@ def train(config: Config):
         config.dataset_name,
         config.dataset_split,
         seed=config.seed,
+        include_negative_examples=config.include_negative_examples,
+        negative_example_ratio=config.negative_example_ratio,
     )
     
     # create model
@@ -540,9 +653,10 @@ def train(config: Config):
                 else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
                 for d in batch_data
             ]).to(device)
+            batch_is_positive = torch.tensor([d.get('is_positive', True) for d in batch_data], dtype=torch.bool).to(device)
             
             # forward pass
-            loss, info = compute_sft_loss(policy, batch_obs, batch_actions, batch_masks)
+            loss, info = compute_sft_loss(policy, batch_obs, batch_actions, batch_masks, batch_is_positive)
             
             # backward pass
             optimizer.zero_grad()
@@ -550,7 +664,7 @@ def train(config: Config):
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
             
-            epoch_losses.append(info['loss'])
+            epoch_losses.append(info)
             epoch_accuracies.append(info['accuracy'])
             
             # save first batch for logging example moves
@@ -561,9 +675,16 @@ def train(config: Config):
                 batch_masks_for_logging = batch_masks
         
         # logging
-        avg_loss = np.mean(epoch_losses)
-        avg_accuracy = np.mean(epoch_accuracies)
+        avg_loss = np.mean([d['loss'] for d in epoch_losses])
+        avg_accuracy = np.mean([d['accuracy'] for d in epoch_losses])
+        avg_negative_accuracy = np.mean([d.get('negative_accuracy', 0.0) for d in epoch_losses])
+        total_positive = sum(d.get('positive_count', 0) for d in epoch_losses)
+        total_negative = sum(d.get('negative_count', 0) for d in epoch_losses)
+        
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
+        if total_negative > 0:
+            print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
+            print(f"  Negative accuracy (avoiding illegal actions): {avg_negative_accuracy:.4f}")
         
         # log example moves
         if batch_data_for_logging is not None:
@@ -579,11 +700,16 @@ def train(config: Config):
                 num_examples=5,
             )
         
-        wandb.log({
+        log_dict = {
             "epoch": epoch + 1,
             "train/loss": avg_loss,
             "train/accuracy": avg_accuracy,
-        })
+        }
+        if total_negative > 0:
+            log_dict["train/negative_accuracy"] = avg_negative_accuracy
+            log_dict["train/positive_count"] = total_positive
+            log_dict["train/negative_count"] = total_negative
+        wandb.log(log_dict)
         
         # checkpoint
         if (epoch + 1) % config.checkpoint_interval == 0:

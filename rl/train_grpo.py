@@ -82,7 +82,7 @@ class Config:
     render_interval: int = 5
     render_env_idx: int = 0
     load_checkpoint: Optional[str] = None  # path to checkpoint to load at start
-    use_legal_only_masks: bool = True  # use legal-only masks (required when loading from SFT)
+    use_legal_only_masks: bool = False  # use legal-only masks (only needed for old SFT checkpoints that didn't learn legality)
 
 
 class RolloutBuffer:
@@ -330,6 +330,7 @@ def collect_rollouts(
                     mask = env.get_legal_only_mask()
             else:
                 # use standard action mask (all geometrically valid actions)
+                # policy learned legality in SFT, so it can handle all actions and avoid illegal ones
                 mask = env.get_action_mask()
             masks_list.append(mask)
             phases.append(env.phase)
@@ -435,16 +436,18 @@ def collect_rollouts(
                 # for Phase-1, we need to create a full-size mask (170) with only valid positions
                 # Phase-1 action space is variable, so we pad the mask
                 full_mask = torch.zeros(170, dtype=torch.bool, device=obs.device)
-                # extract only the True values from valid_mask and place them at the start
                 # find indices where valid_mask is True
                 valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).to(obs.device)
-                # place them at the beginning of full_mask
-                full_mask[:valid_action_count] = True
+                # ensure valid_indices is 1D (squeeze might make it 0D if empty, but we already checked valid_action_count > 0)
+                if valid_indices.dim() == 0:
+                    valid_indices = valid_indices.unsqueeze(0)
+                # set full_mask to True at the actual valid indices (not necessarily contiguous from 0)
+                full_mask[valid_indices] = True
                 
                 with torch.no_grad():
                     logits, _ = frozen_policy(phase1_obs[i:i+1], full_mask.unsqueeze(0))
-                    # extract only valid logits
-                    valid_logits = logits[0][:valid_action_count]
+                    # extract logits at valid indices (not necessarily at the beginning)
+                    valid_logits = logits[0][valid_indices]
                     
                     # apply temperature for diversity (higher temp = more exploration)
                     scaled_logits = valid_logits / max(config.grpo_temperature, 1e-8)
