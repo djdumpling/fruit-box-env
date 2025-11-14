@@ -46,14 +46,19 @@ class Config:
     dataset_split: str = "train"
     
     # training
-    epochs: int = 10
-    batch_size: int = 64
-    lr: float = 1e-4
+    epochs: int = 200
+    batch_size: int = 128  # increased for more stable gradients
+    lr: float = 2e-4  # increased learning rate for faster convergence
     weight_decay: float = 1e-5
     
     # negative examples (for learning legality)
     include_negative_examples: bool = True
-    negative_example_ratio: float = 0.5  # ratio of negative to positive examples
+    negative_example_ratio: float = 1.0  # ratio of negative to positive examples (1.0 = 1 negative per positive on average)
+    # note: real-world ratio is ~41:1 illegal to legal, but we use 1.0 because:
+    # - positive examples are more informative (show correct actions)
+    # - negative_loss_weight (2.0) already emphasizes negative examples
+    # - too many negatives can make model overly conservative
+    negative_loss_weight: float = 2.0  # weight for negative example loss (higher = more emphasis on avoiding illegal actions)
     
     # other
     seed: int = 42
@@ -486,11 +491,13 @@ def compute_sft_loss(
     actions: torch.Tensor,
     masks: torch.Tensor,
     is_positive: Optional[torch.Tensor] = None,
+    negative_loss_weight: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute SFT loss. Masks can be sparse (only legal actions) or contiguous
     
-    For positive examples: model should predict the correct (legal) action
-    For negative examples: model should learn to avoid the illegal action (same loss, different accuracy metric)
+    For positive examples: standard cross-entropy to maximize probability of correct (legal) action
+    For negative examples: penalize high probability on illegal action using -log(1 - prob(illegal))
+    This ensures the model learns to avoid illegal actions rather than being encouraged to predict them.
     """
     logits, _ = policy(obs, masks)  # [batch_size, 170]
     
@@ -531,17 +538,29 @@ def compute_sft_loss(
             # single match - squeeze to scalar and get item
             action_compact = action_pos.squeeze().item()
         
-        # create cross-entropy loss (same for positive and negative examples)
-        # for negative examples, this teaches the model to assign low probability to illegal actions
-        loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
+        # check if this is a negative example (needed before computing loss)
+        is_neg = is_positive is not None and not is_positive[b].item() if is_positive is not None else False
+        
+        # compute loss differently for positive vs negative examples
+        if is_neg:
+            # for negative examples: penalize high probability on the illegal action
+            # use negative log of (1 - prob(illegal)) to push probability down
+            log_probs = F.log_softmax(valid_logits, dim=0)
+            illegal_log_prob = log_probs[action_compact]
+            # loss = -log(1 - exp(illegal_log_prob)) = -log(1 - prob(illegal))
+            # use numerical stability: log(1 - exp(x)) = log1p(-exp(x))
+            illegal_prob = torch.exp(illegal_log_prob)
+            # clamp to avoid numerical issues
+            illegal_prob = torch.clamp(illegal_prob, min=1e-8, max=1.0 - 1e-8)
+            loss = -torch.log1p(-illegal_prob) * negative_loss_weight
+        else:
+            # for positive examples: standard cross-entropy to maximize probability of correct action
+            loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
         losses.append(loss)
         
         # compute accuracy
         pred_action_compact = valid_logits.argmax().item()
         pred_action_original = valid_indices[pred_action_compact].item()
-        
-        # check if this is a negative example
-        is_neg = is_positive is not None and not is_positive[b].item() if is_positive is not None else False
         
         if is_neg:
             # for negative examples: correct = model does NOT predict the illegal action
@@ -656,7 +675,10 @@ def train(config: Config):
             batch_is_positive = torch.tensor([d.get('is_positive', True) for d in batch_data], dtype=torch.bool).to(device)
             
             # forward pass
-            loss, info = compute_sft_loss(policy, batch_obs, batch_actions, batch_masks, batch_is_positive)
+            loss, info = compute_sft_loss(
+                policy, batch_obs, batch_actions, batch_masks, batch_is_positive,
+                negative_loss_weight=config.negative_loss_weight
+            )
             
             # backward pass
             optimizer.zero_grad()
@@ -755,7 +777,7 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=10)
+    parser.add_argument("--checkpoint_interval", type=int, default=20)
     args = parser.parse_args()
     
     config = Config(
