@@ -38,11 +38,13 @@ class Config:
     
     # negative examples (for learning legality)
     include_negative_examples: bool = True
-    negative_example_ratio: float = 2.0  # ratio of negative to positive examples (increased from 1.0 to expose more illegal actions)
-    # note: real-world ratio is ~41:1 illegal to legal, but we use 2.0 because:
-    # - need more negative examples to learn to avoid illegal actions when they're in the mask
-    # - negative_loss_weight (5.0) emphasizes negative examples
-    # - balance: too many negatives can make model overly conservative, but too few means it won't learn legality
+    negative_example_ratio: float = 10.0  # ratio of negative to positive examples
+    # note: real-world ratio is ~41:1 illegal to legal (out of 8415 possible rectangles, ~200 are legal)
+    # using 10:1 as a balance:
+    # - much higher than 2:1 (which still struggled with 20% legality in GRPO)
+    # - still less than 41:1 to avoid making model overly conservative
+    # - combined with negative_loss_weight (5.0) should teach strong legality
+    # if 10:1 isn't enough, can increase further (e.g., 20:1 or even 41:1)
     negative_loss_weight: float = 5.0  # weight for negative example loss (increased from 2.0 for stronger penalty)
     
     # other
@@ -308,8 +310,11 @@ def load_and_process_dataset(
             if include_negative_examples:
                 illegal_anchors_set = compute_illegal_anchors(grid, legal_anchors_set)
                 if illegal_anchors_set:
-                    # sample negative anchors according to ratio (probabilistic: generate with probability = ratio)
-                    num_negative = 1 if random.random() < negative_example_ratio else 0
+                    # sample negative anchors according to ratio
+                    # if ratio = 2.0, generate 2 negatives per positive on average
+                    base_count = int(negative_example_ratio)
+                    fractional = negative_example_ratio - base_count
+                    num_negative = base_count + (1 if random.random() < fractional else 0)
                     if num_negative > 0:
                         sampled_illegal = random.sample(list(illegal_anchors_set), min(num_negative, len(illegal_anchors_set)))
                     else:
@@ -373,21 +378,26 @@ def load_and_process_dataset(
             if include_negative_examples:
                 illegal_extents_set = compute_illegal_extents(grid, r1, c1, legal_extents_set)
                 if illegal_extents_set:
-                    # sample negative extents according to ratio (probabilistic: generate with probability = ratio)
-                    num_negative = 1 if random.random() < negative_example_ratio else 0
+                    # sample negative extents according to ratio
+                    # if ratio = 2.0, generate 2 negatives per positive on average
+                    base_count = int(negative_example_ratio)
+                    fractional = negative_example_ratio - base_count
+                    num_negative = base_count + (1 if random.random() < fractional else 0)
                     if num_negative > 0:
                         sampled_illegal = random.sample(list(illegal_extents_set), min(num_negative, len(illegal_extents_set)))
                     else:
                         sampled_illegal = []
                     
                     for illegal_extent_idx in sampled_illegal:
-                        phase1_data.append({
-                            'obs': torch.from_numpy(phase1_obs).float(),  # same observation
-                            'action': torch.tensor(illegal_extent_idx, dtype=torch.long),  # illegal extent
-                            'mask': phase1_mask,  # all extents included
-                            'anchor': torch.tensor(phase0_action, dtype=torch.long),
-                            'is_positive': False,  # mark as negative example
-                        })
+                        # ensure illegal extent index is within mask bounds
+                        if illegal_extent_idx < 170:
+                            phase1_data.append({
+                                'obs': torch.from_numpy(phase1_obs).float(),  # same observation
+                                'action': torch.tensor(illegal_extent_idx, dtype=torch.long),  # illegal extent
+                                'mask': phase1_mask,  # all extents included
+                                'anchor': torch.tensor(phase0_action, dtype=torch.long),
+                                'is_positive': False,  # mark as negative example
+                            })
     
     total_examples = len(phase0_data) + len(phase1_data)
     phase0_positive = sum(1 for d in phase0_data if d.get('is_positive', True))
