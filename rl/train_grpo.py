@@ -1223,11 +1223,21 @@ def main():
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--load-checkpoint", type=str, default=None, 
-                       help="Path to checkpoint file to load at start (e.g., 'checkpoints/policy_sft_epoch100.pt')")
+    parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to checkpoint file to load at start")
+    parser.add_argument("--use-legal-only-masks", action="store_true",
+                       help="Use legal-only masks (required when loading SFT checkpoints)")
+    parser.add_argument("--no-legal-only-masks", action="store_true",
+                       help="Disable legal-only masks even when loading checkpoints")
     args = parser.parse_args()
     
-    config = Config(seed=args.seed, load_checkpoint=args.load_checkpoint)
+    # auto-enable legal-only masks when loading SFT checkpoints (unless explicitly disabled)
+    use_legal_only = args.use_legal_only_masks
+    if args.load_checkpoint and not args.no_legal_only_masks:
+        # SFT checkpoints were trained/evaluated with legal-only masks
+        use_legal_only = True
+        print(f"Auto-enabling legal-only masks for SFT checkpoint (use --no-legal-only-masks to disable)")
+    
+    config = Config(seed=args.seed, load_checkpoint=args.load_checkpoint, use_legal_only_masks=use_legal_only)
     train(config, use_wandb=not args.no_wandb)
 
 

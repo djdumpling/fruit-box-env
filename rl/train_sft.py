@@ -38,12 +38,12 @@ class Config:
     
     # negative examples (for learning legality)
     include_negative_examples: bool = True
-    negative_example_ratio: float = 1.0  # ratio of negative to positive examples (1.0 = 1 negative per positive on average)
-    # note: real-world ratio is ~41:1 illegal to legal, but we use 1.0 because:
-    # - positive examples are more informative (show correct actions)
-    # - negative_loss_weight (2.0) already emphasizes negative examples
-    # - too many negatives can make model overly conservative
-    negative_loss_weight: float = 2.0  # weight for negative example loss (higher = more emphasis on avoiding illegal actions)
+    negative_example_ratio: float = 2.0  # ratio of negative to positive examples (increased from 1.0 to expose more illegal actions)
+    # note: real-world ratio is ~41:1 illegal to legal, but we use 2.0 because:
+    # - need more negative examples to learn to avoid illegal actions when they're in the mask
+    # - negative_loss_weight (5.0) emphasizes negative examples
+    # - balance: too many negatives can make model overly conservative, but too few means it won't learn legality
+    negative_loss_weight: float = 5.0  # weight for negative example loss (increased from 2.0 for stronger penalty)
     
     # other
     seed: int = 42
@@ -537,7 +537,11 @@ def compute_sft_loss(
             illegal_prob = torch.exp(illegal_log_prob)
             # clamp to avoid numerical issues
             illegal_prob = torch.clamp(illegal_prob, min=1e-8, max=1.0 - 1e-8)
-            loss = -torch.log1p(-illegal_prob) * negative_loss_weight
+            # stronger loss: combine log penalty with squared penalty for better gradients
+            # when prob is low, log term has weak gradients, but squared term still provides signal
+            log_penalty = -torch.log1p(-illegal_prob)
+            squared_penalty = illegal_prob ** 2
+            loss = (log_penalty + squared_penalty) * negative_loss_weight
         else:
             # for positive examples: standard cross-entropy to maximize probability of correct action
             loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
