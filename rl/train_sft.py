@@ -299,34 +299,16 @@ def load_and_process_dataset(
                 for legal_anchor_idx in sorted(legal_anchors_set):
                     phase0_mask[legal_anchor_idx] = True
             
+            # store positive example with metadata for on-the-fly negative generation
             phase0_data.append({
                 'obs': torch.from_numpy(phase0_obs).float(),
                 'action': torch.tensor(phase0_action, dtype=torch.long),
                 'mask': phase0_mask,
-                'is_positive': True,  # mark as positive example
+                'is_positive': True,
+                'grid': grid.copy(),  # needed for negative generation
+                'legal_anchors_set': legal_anchors_set.copy(),  # needed for negative generation
+                'phase': 0,
             })
-            
-            # generate negative examples for Phase-0 if enabled
-            if include_negative_examples:
-                illegal_anchors_set = compute_illegal_anchors(grid, legal_anchors_set)
-                if illegal_anchors_set:
-                    # sample negative anchors according to ratio
-                    # if ratio = 2.0, generate 2 negatives per positive on average
-                    base_count = int(negative_example_ratio)
-                    fractional = negative_example_ratio - base_count
-                    num_negative = base_count + (1 if random.random() < fractional else 0)
-                    if num_negative > 0:
-                        sampled_illegal = random.sample(list(illegal_anchors_set), min(num_negative, len(illegal_anchors_set)))
-                    else:
-                        sampled_illegal = []
-                    
-                    for illegal_anchor_idx in sampled_illegal:
-                        phase0_data.append({
-                            'obs': torch.from_numpy(phase0_obs).float(),  # same observation
-                            'action': torch.tensor(illegal_anchor_idx, dtype=torch.long),  # illegal anchor
-                            'mask': phase0_mask,  # all anchors included
-                            'is_positive': False,  # mark as negative example
-                        })
             
             # phase-1: select extent (r2, c2) given anchor (r1, c1)
             phase1_obs = build_observation(grid, phase=1, selected_anchor=(r1, c1))
@@ -366,52 +348,31 @@ def load_and_process_dataset(
                     if legal_idx < 170:  # Safety check
                         phase1_mask[legal_idx] = True
             
+            # store positive example with metadata for on-the-fly negative generation
             phase1_data.append({
                 'obs': torch.from_numpy(phase1_obs).float(),
                 'action': torch.tensor(phase1_action_compact, dtype=torch.long),
                 'mask': phase1_mask,
                 'anchor': torch.tensor(phase0_action, dtype=torch.long),
-                'is_positive': True,  # mark as positive example
+                'is_positive': True,
+                'grid': grid.copy(),  # needed for negative generation
+                'r1': r1,  # needed for negative generation
+                'c1': c1,  # needed for negative generation
+                'legal_extents_set': legal_extents_set.copy(),  # needed for negative generation
+                'phase': 1,
             })
-            
-            # generate negative examples for Phase-1 if enabled
-            if include_negative_examples:
-                illegal_extents_set = compute_illegal_extents(grid, r1, c1, legal_extents_set)
-                if illegal_extents_set:
-                    # sample negative extents according to ratio
-                    # if ratio = 2.0, generate 2 negatives per positive on average
-                    base_count = int(negative_example_ratio)
-                    fractional = negative_example_ratio - base_count
-                    num_negative = base_count + (1 if random.random() < fractional else 0)
-                    if num_negative > 0:
-                        sampled_illegal = random.sample(list(illegal_extents_set), min(num_negative, len(illegal_extents_set)))
-                    else:
-                        sampled_illegal = []
-                    
-                    for illegal_extent_idx in sampled_illegal:
-                        # ensure illegal extent index is within mask bounds
-                        if illegal_extent_idx < 170:
-                            phase1_data.append({
-                                'obs': torch.from_numpy(phase1_obs).float(),  # same observation
-                                'action': torch.tensor(illegal_extent_idx, dtype=torch.long),  # illegal extent
-                                'mask': phase1_mask,  # all extents included
-                                'anchor': torch.tensor(phase0_action, dtype=torch.long),
-                                'is_positive': False,  # mark as negative example
-                            })
     
-    total_examples = len(phase0_data) + len(phase1_data)
-    phase0_positive = sum(1 for d in phase0_data if d.get('is_positive', True))
-    phase0_negative = len(phase0_data) - phase0_positive
-    phase1_positive = sum(1 for d in phase1_data if d.get('is_positive', True))
-    phase1_negative = len(phase1_data) - phase1_positive
-    
-    print(f"Processed {len(phase0_data)} Phase-0 examples ({phase0_positive} positive, {phase0_negative} negative)")
-    print(f"Processed {len(phase1_data)} Phase-1 examples ({phase1_positive} positive, {phase1_negative} negative)")
-    print(f"Total training examples: {total_examples}")
+    # only positive examples are stored (negatives generated on-the-fly)
+    total_positive = len(phase0_data) + len(phase1_data)
+    print(f"Processed {len(phase0_data)} Phase-0 positive examples")
+    print(f"Processed {len(phase1_data)} Phase-1 positive examples")
+    if include_negative_examples:
+        print(f"Negatives will be generated on-the-fly during training with ratio {negative_example_ratio}:1")
+        print(f"  (Effective training examples per epoch: ~{int(total_positive * (1 + negative_example_ratio))})")
     print(f"Cache statistics:")
     print(f"  Unique grid states (legal anchors cache): {len(legal_anchors_cache)}")
     print(f"  Unique (grid, anchor) pairs (legal extents cache): {len(legal_extents_cache)}")
-    print(f"  Cache hit rate: {100 * (1 - len(legal_anchors_cache) / max(total_examples, 1)):.1f}% (anchors), "
+    print(f"  Cache hit rate: {100 * (1 - len(legal_anchors_cache) / max(total_positive, 1)):.1f}% (anchors), "
           f"{100 * (1 - len(legal_extents_cache) / max(len(phase1_data), 1)):.1f}% (extents)")
     return phase0_data, phase1_data
 
@@ -478,6 +439,66 @@ def log_example_moves(
             examples_logged += 1
         
         policy.train()
+
+
+def generate_negatives_for_positive(
+    positive_example: Dict,
+    negative_example_ratio: float,
+) -> List[Dict]:
+    """Generate negative examples for a positive example on-the-fly
+    
+    Returns a list of negative examples to maintain the desired ratio.
+    """
+    negatives = []
+    grid = positive_example['grid']
+    phase = positive_example['phase']
+    
+    if phase == 0:
+        # Phase-0: generate negative anchors
+        legal_anchors_set = positive_example['legal_anchors_set']
+        illegal_anchors_set = compute_illegal_anchors(grid, legal_anchors_set)
+        if illegal_anchors_set:
+            base_count = int(negative_example_ratio)
+            fractional = negative_example_ratio - base_count
+            num_negative = base_count + (1 if random.random() < fractional else 0)
+            if num_negative > 0:
+                sampled_illegal = random.sample(
+                    list(illegal_anchors_set), 
+                    min(num_negative, len(illegal_anchors_set))
+                )
+                for illegal_anchor_idx in sampled_illegal:
+                    negatives.append({
+                        'obs': positive_example['obs'].clone(),
+                        'action': torch.tensor(illegal_anchor_idx, dtype=torch.long),
+                        'mask': positive_example['mask'].clone(),
+                        'is_positive': False,
+                    })
+    else:
+        # Phase-1: generate negative extents
+        r1 = positive_example['r1']
+        c1 = positive_example['c1']
+        legal_extents_set = positive_example['legal_extents_set']
+        illegal_extents_set = compute_illegal_extents(grid, r1, c1, legal_extents_set)
+        if illegal_extents_set:
+            base_count = int(negative_example_ratio)
+            fractional = negative_example_ratio - base_count
+            num_negative = base_count + (1 if random.random() < fractional else 0)
+            if num_negative > 0:
+                sampled_illegal = random.sample(
+                    list(illegal_extents_set),
+                    min(num_negative, len(illegal_extents_set))
+                )
+                for illegal_extent_idx in sampled_illegal:
+                    if illegal_extent_idx < 170:  # safety check
+                        negatives.append({
+                            'obs': positive_example['obs'].clone(),
+                            'action': torch.tensor(illegal_extent_idx, dtype=torch.long),
+                            'mask': positive_example['mask'].clone(),
+                            'anchor': positive_example['anchor'].clone(),
+                            'is_positive': False,
+                        })
+    
+    return negatives
 
 
 def compute_sft_loss(
@@ -647,10 +668,12 @@ def train(config: Config):
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
-        # combine Phase-0 and Phase-1 data (using ALL datapoints)
-        all_data = phase0_data + phase1_data
-        random.shuffle(all_data)
-        print(f"  Training on {len(all_data)} total examples ({len(phase0_data)} Phase-0 + {len(phase1_data)} Phase-1)")
+        # combine Phase-0 and Phase-1 positive examples only
+        all_positive_data = phase0_data + phase1_data
+        random.shuffle(all_positive_data)
+        print(f"  Training on {len(all_positive_data)} positive examples ({len(phase0_data)} Phase-0 + {len(phase1_data)} Phase-1)")
+        if config.include_negative_examples:
+            print(f"  Generating negatives on-the-fly with ratio {config.negative_example_ratio}:1")
         
         policy.train()
         epoch_losses = []
@@ -660,8 +683,37 @@ def train(config: Config):
         batch_actions_for_logging = None
         batch_masks_for_logging = None
         
-        for batch_idx, start in enumerate(tqdm(range(0, len(all_data), config.batch_size), desc="Training")):
-            batch_data = all_data[start:start + config.batch_size]
+        # calculate batch composition: if ratio=10:1, batch_size=128, then ~11 positives, ~117 negatives
+        if config.include_negative_examples:
+            ratio = config.negative_example_ratio
+            positive_per_batch = max(1, int(config.batch_size / (ratio + 1)))
+            negative_per_batch = config.batch_size - positive_per_batch
+        else:
+            positive_per_batch = config.batch_size
+            negative_per_batch = 0
+        
+        for batch_idx, start in enumerate(tqdm(range(0, len(all_positive_data), positive_per_batch), desc="Training")):
+            # sample positive examples for this batch
+            batch_positives = all_positive_data[start:start + positive_per_batch]
+            
+            # generate negative examples on-the-fly for each positive
+            batch_negatives = []
+            if config.include_negative_examples:
+                for pos_example in batch_positives:
+                    negs = generate_negatives_for_positive(pos_example, config.negative_example_ratio)
+                    # limit negatives per positive to maintain batch size
+                    if len(batch_negatives) + len(negs) <= negative_per_batch:
+                        batch_negatives.extend(negs)
+                    else:
+                        # take only what we need
+                        remaining = negative_per_batch - len(batch_negatives)
+                        batch_negatives.extend(negs[:remaining])
+                        break
+            
+            # combine positives and negatives into batch
+            batch_data = batch_positives + batch_negatives
+            # shuffle to mix positives and negatives
+            random.shuffle(batch_data)
             
             # stack batches (masks already padded to 170)
             batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
