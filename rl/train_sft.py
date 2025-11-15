@@ -1,19 +1,4 @@
-"""
-Supervised Fine-Tuning (SFT) for Fruit Box environment.
-
-This script loads trajectories from the Hugging Face dataset and trains a CNNPolicy
-model using supervised learning. The trained model can then be used as a starting
-point for GRPO training in train_grpo.py.
-
-The model architecture matches train_grpo.py exactly, so checkpoints are compatible.
-To load an SFT checkpoint in train_grpo.py, modify the code to load the checkpoint
-before training starts:
-    policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
-    policy.load_state_dict(torch.load("checkpoints/policy_sft_final.pt", map_location=device))
-
-Usage:
-    python rl/train_sft.py --seed 42 --epochs 200 --batch_size 64 --lr 1e-4
-"""
+""" python rl/train_sft.py --seed 42 --epochs 200 --batch_size 128 --lr 2e-4 """
 
 import sys
 from pathlib import Path

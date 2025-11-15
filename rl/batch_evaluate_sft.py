@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+import json
 import numpy as np
 import torch
 from typing import Dict, List, Tuple
@@ -152,40 +153,56 @@ def run_policy_on_grid(
     }
 
 
+def load_checkpoint_from_wandb(artifact_path: str) -> str:
+    """Download checkpoint from wandb artifact and return local path.
+    
+    Args:
+        artifact_path: Wandb artifact path (e.g., 'djdumpling-yale/fruit-box-sft/sft-checkpoint-epoch-160:v0')
+    
+    Returns:
+        Local path to the checkpoint file
+    """
+    import wandb
+    
+    print(f"Downloading wandb artifact: {artifact_path}")
+    # Initialize wandb run to access artifacts
+    run = wandb.init()
+    artifact = run.use_artifact(artifact_path, type='model')
+    artifact_dir = artifact.download()
+    
+    # Find the checkpoint file in the artifact directory
+    artifact_path_obj = Path(artifact_dir)
+    checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+    
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+    
+    if len(checkpoint_files) > 1:
+        print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+    
+    checkpoint_path = str(checkpoint_files[0])
+    print(f"Downloaded checkpoint to: {checkpoint_path}")
+    return checkpoint_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch evaluate SFT policy on random grids")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to SFT checkpoint (e.g., 'checkpoints/policy_sft_epoch30.pt')"
-    )
-    parser.add_argument(
-        "--num_grids",
-        type=int,
-        default=30,
-        help="Number of random grids to evaluate"
-    )
-    parser.add_argument(
-        "--max_moves",
-        type=int,
-        default=50,
-        help="Maximum moves per grid"
-    )
-    parser.add_argument(
-        "--seed_start",
-        type=int,
-        default=0,
-        help="Starting seed for grid generation (grids use seeds from seed_start to seed_start+num_grids-1)"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to use (cuda/cpu, defaults to auto)"
-    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path or wandb artifact")
+    parser.add_argument("--wandb-artifact", action="store_true", help="Download checkpoint from wandb")
+    parser.add_argument("--num_grids", type=int, default=30, help="Number of grids to evaluate")
+    parser.add_argument("--max_moves", type=int, default=50, help="Max moves per grid")
+    parser.add_argument("--seed_start", type=int, default=10000, help="Starting seed (default: 10000 to avoid training data)")
+    parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu, auto if not specified)")
+    parser.add_argument("--output", type=str, default=None, help="Output path for episodes.jsonl")
+    parser.add_argument("--agent_tag", type=str, default="sft", help="Agent tag in episodes.jsonl")
     
     args = parser.parse_args()
+    
+    # handle wandb artifact download if needed
+    checkpoint_path = args.checkpoint
+    if args.wandb_artifact or (args.checkpoint.startswith("djdumpling") or "/" in args.checkpoint and ":" in args.checkpoint):
+        # Looks like a wandb artifact path
+        checkpoint_path = load_checkpoint_from_wandb(args.checkpoint)
     
     # setup device
     if args.device:
@@ -194,11 +211,11 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Device: {device}")
-    print(f"Loading checkpoint from {args.checkpoint}...")
+    print(f"Loading checkpoint from {checkpoint_path}...")
     
     # load policy
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
-    policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
     print("Policy loaded successfully!")
     
@@ -299,8 +316,28 @@ def main():
     print(f"Overall legality rate: {overall_legality:.2%}")
     print(f"Average cells cleared per grid: {np.mean(all_total_cleared):.1f}")
     print(f"Total cells cleared across all grids: {sum(all_total_cleared)}")
-
+    
+    # export episodes.jsonl if output path is specified
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        episodes = []
+        for result in all_results:
+            episode = {
+                "episode_id": f"seed{result['grid_seed']}",
+                "seed": result['grid_seed'],
+                "agent_tag": args.agent_tag,
+                "total_reward": int(result['total_cells_cleared']),
+                "total_steps": int(result['num_moves'])
+            }
+            episodes.append(episode)
+        
+        with open(output_path, 'w') as f:
+            for episode in episodes:
+                f.write(json.dumps(episode) + '\n')
+        
+        print(f"\nExported {len(episodes)} episodes to: {output_path}")
 
 if __name__ == "__main__":
     main()
-

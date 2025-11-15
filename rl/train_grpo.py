@@ -35,10 +35,10 @@ from fruit_box import Sum10Env
 
 @dataclass
 class Config:
-    """Training config for GRPO fine-tuning from SFT policy
+    """Training config for GRPO strategy learning from SFT policy
     
-    SFT policy already hits 100% legality, so we're just tweaking it to get better rewards.
-    Lower LRs, less exploration, tighter clipping, fewer updates.
+    SFT policy learned legality (0.9998 negative accuracy, 0.94 accuracy) but uses random strategy.
+    We'll learn optimal strategy (minimal area approach) with aggressive exploration that gradually reduces.
     """
     # data collection
     num_envs: int = 16
@@ -47,13 +47,13 @@ class Config:
     epochs: int = 4
     
     # phase-0 (PPO) hyperparameters
-    phase0_lr: float = 1.5e-5  # was 3e-5, lowered for fine-tuning
+    phase0_lr: float = 3e-5  # higher for strategy learning
     phase0_clip_eps: float = 0.08  # was 0.12, tighter to avoid breaking the good policy
     phase0_target_kl: float = 0.005  # was 0.008, keep updates small
     phase0_value_coef: float = 0.8
     
     # phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 2.5e-5  # was 5e-5, same reasoning as phase0
+    phase1_lr: float = 5e-5  # higher for strategy learning
     phase1_clip_eps: float = 0.15  # was 0.2
     phase1_target_ratio: float = 2.0  # was 2.5
     grpo_k: int = 16  # was 24, don't need as much exploration
@@ -62,18 +62,30 @@ class Config:
     min_reward_std: float = 0.01
     
     # shared hyperparameters
-    max_updates: int = 1500  # was 2500, should converge faster
-    gamma: float = 0.995
+    max_updates: int = 2500  # more updates for strategy learning
+    gamma: float = 0.995  # standard discount, no augment factor
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.02  # was 0.05, policy already knows what to do
-    entropy_target: float = 0.3  # was 0.5, lower is fine since it's already tuned
-    entropy_penalty_coef: float = 0.15  # was 0.2
+    entropy_coef: float = 0.05  # start higher for exploration
+    entropy_target: float = 0.5  # start higher
+    entropy_penalty_coef: float = 0.2  # stronger penalty
     grad_clip: float = 1.0
     lr_warmup_steps: int = 50  # was 100, policy is already good so less warmup needed
+    
+    # exploration schedule
+    exploration_schedule: str = "linear"  # linear decay of entropy over time
+    exploration_start_coef: float = 0.05  # starting entropy coefficient
+    exploration_end_coef: float = 0.02  # ending entropy coefficient
+    exploration_start_target: float = 0.5  # starting entropy target
+    exploration_end_target: float = 0.3  # ending entropy target
     
     # curriculum learning
     curriculum_updates: int = 0  # disabled, SFT already handles legal moves
     illegal_penalty: float = -0.1
+    
+    # minimal area curriculum
+    use_minimal_area_curriculum: bool = False  # use grids from minimal_area policy
+    minimal_area_dataset: str = "djdumpling/fruit-box-minimal-area"
+    minimal_area_num_grids: int = 100  # number of grids to load
     
     # other
     seed: int = 42
@@ -263,9 +275,47 @@ def visualize_action(
     print()
 
 
-def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400):
+def get_exploration_coef(update: int, max_updates: int, start_coef: float, end_coef: float) -> float:
+    """Linear schedule from start_coef to end_coef over max_updates"""
+    if max_updates <= 0:
+        return start_coef
+    progress = min(update / max_updates, 1.0)
+    return start_coef + (end_coef - start_coef) * progress
+
+
+def load_minimal_area_grids(dataset_name: str, num_grids: int) -> List[np.ndarray]:
+    """Load initial grids from dataset filtered by agent_tag='minimal_area'"""
+    from datasets import load_dataset
+    hf_dataset = load_dataset(dataset_name, split="train")
+    grids = []
+    seen_episodes = set()
+    for row in hf_dataset:
+        if row.get("agent_tag") == "minimal_area":
+            ep_id = row.get("episode_id")
+            if ep_id is not None and ep_id not in seen_episodes and row.get("step", -1) == 0:
+                grid_data = row.get("grid")
+                if grid_data is not None:
+                    grids.append(np.array(grid_data, dtype=np.uint8))
+                    seen_episodes.add(ep_id)
+                    if len(grids) >= num_grids:
+                        break
+    if len(grids) == 0:
+        print(f"WARNING: No minimal_area grids found in dataset {dataset_name}. Using random grids instead.")
+    else:
+        print(f"Loaded {len(grids)} initial grids from minimal_area policy")
+    return grids
+
+
+def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400, initial_grids: Optional[List[np.ndarray]] = None, grid_index: int = 0):
     """Create environment"""
-    env = Sum10GymEnv(initial_grid=initial_grid, seed=seed)
+    # if initial_grids provided, use the grid at grid_index (cycling through)
+    if initial_grids is not None and len(initial_grids) > 0:
+        grid_to_use = initial_grids[grid_index % len(initial_grids)]
+        env = Sum10GymEnv(initial_grid=grid_to_use, seed=seed)
+    elif initial_grid is not None:
+        env = Sum10GymEnv(initial_grid=initial_grid, seed=seed)
+    else:
+        env = Sum10GymEnv(seed=seed)
     env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
     return env
 
@@ -682,10 +732,16 @@ def train(config: Config, use_wandb: bool = True):
     import os
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     
+    # load minimal_area grids if curriculum enabled
+    initial_grids = None
+    if config.use_minimal_area_curriculum:
+        print(f"Loading minimal_area grids from {config.minimal_area_dataset}...")
+        initial_grids = load_minimal_area_grids(config.minimal_area_dataset, config.minimal_area_num_grids)
+    
     # create environments (create first, reset later to avoid segfault)
     envs = []
     for i in range(config.num_envs):
-        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates)
+        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates, initial_grids=initial_grids, grid_index=i)
         envs.append(env)
     print(f"All {len(envs)} environments created")
     
@@ -736,6 +792,9 @@ def train(config: Config, use_wandb: bool = True):
     print("Creating buffer...")
     buffer = RolloutBuffer(config.rollout_steps, config.num_envs, (4, 10, 17), device)
     
+    # recovery mechanism: track if we need to override schedule
+    entropy_override_coef = None
+    entropy_override_target = None
     
     # training loop
     global_step = 0
@@ -747,6 +806,21 @@ def train(config: Config, use_wandb: bool = True):
                 param_group['lr'] = config.phase0_lr * lr_mult
             for param_group in phase1_optimizer.param_groups:
                 param_group['lr'] = config.phase1_lr * lr_mult
+        
+        # update exploration schedule (linear decay)
+        # use override if recovery mechanism activated, otherwise use schedule
+        if entropy_override_coef is not None:
+            current_entropy_coef = entropy_override_coef
+            current_entropy_target = entropy_override_target
+        else:
+            current_entropy_coef = get_exploration_coef(
+                update, config.max_updates,
+                config.exploration_start_coef, config.exploration_end_coef
+            )
+            current_entropy_target = get_exploration_coef(
+                update, config.max_updates,
+                config.exploration_start_target, config.exploration_end_target
+            )
         
         # update curriculum
         for env in envs:
@@ -835,8 +909,8 @@ def train(config: Config, use_wandb: bool = True):
                     batch_masks,
                     config.phase0_clip_eps,
                     config.phase0_value_coef,
-                    config.entropy_coef,
-                    config.entropy_target,
+                    current_entropy_coef,
+                    current_entropy_target,
                     config.entropy_penalty_coef,
                 )
                 
@@ -1015,12 +1089,29 @@ def train(config: Config, use_wandb: bool = True):
                 # Monitor entropy and intervene before collapse
                 current_entropy = avg_phase0_loss.get('entropy', 5.0)
                 
+                # Clear override if entropy has recovered (above threshold)
+                if entropy_override_coef is not None and current_entropy > 0.5:
+                    print(f"Entropy recovered to {current_entropy:.3f}, clearing override and resuming schedule")
+                    entropy_override_coef = None
+                    entropy_override_target = None
+                
                 # Early warning: entropy dropping too fast - intervene proactively
-                if current_entropy < 0.3 and update > 100:
+                # Only trigger if override is not already active (to avoid repeated interventions)
+                if current_entropy < 0.3 and update > 100 and entropy_override_coef is None:
                     print(f"\nWARNING: Low entropy ({current_entropy:.3f}) at update {update} - adjusting hyperparameters\n")
                     
-                    # Increase entropy coefficient immediately
-                    config.entropy_coef = min(0.15, config.entropy_coef * 1.5)
+                    # Override schedule with higher entropy values
+                    # Use scheduled values (not override) to calculate new override
+                    scheduled_coef = get_exploration_coef(
+                        update, config.max_updates,
+                        config.exploration_start_coef, config.exploration_end_coef
+                    )
+                    scheduled_target = get_exploration_coef(
+                        update, config.max_updates,
+                        config.exploration_start_target, config.exploration_end_target
+                    )
+                    entropy_override_coef = min(0.15, scheduled_coef * 1.5)
+                    entropy_override_target = min(0.5, scheduled_target * 1.2)
                     
                     # Reduce learning rates to stabilize
                     for param_group in phase0_optimizer.param_groups:
@@ -1032,7 +1123,8 @@ def train(config: Config, use_wandb: bool = True):
                     if use_wandb:
                         wandb.log({
                             "recovery/entropy_rescue": 1.0,
-                            "recovery/new_entropy_coef": config.entropy_coef,
+                            "recovery/new_entropy_coef": entropy_override_coef,
+                            "recovery/new_entropy_target": entropy_override_target,
                             "recovery/new_phase0_lr": phase0_optimizer.param_groups[0]['lr'],
                             "recovery/new_phase1_lr": phase1_optimizer.param_groups[0]['lr'],
                         }, step=update)
@@ -1047,6 +1139,8 @@ def train(config: Config, use_wandb: bool = True):
                     "phase0/entropy": avg_phase0_loss.get('entropy', 0),
                     "phase0/entropy_penalty": avg_phase0_loss.get('entropy_penalty', 0),
                     "phase0/clip_fraction": avg_phase0_loss.get('clip_fraction', 0),
+                    "exploration/entropy_coef": current_entropy_coef,
+                    "exploration/entropy_target": current_entropy_target,
                 }, step=update)
         
         if phase1_losses:
