@@ -1,4 +1,6 @@
 """ python rl/train_sft.py --seed 42 --epochs 200 --batch_size 128 --lr 2e-4 """
+# use set-based legality losses
+# penalize all illegal actions simulatenously using set-based losses computed from the same forward pass
 
 import sys
 from pathlib import Path
@@ -36,21 +38,26 @@ class Config:
     lr: float = 2e-4  # increased learning rate for faster convergence
     weight_decay: float = 1e-5
     
-    # negative examples (for learning legality)
+    # negative examples (for learning legality) - reduced ratio since we use set-based losses
     include_negative_examples: bool = True
-    negative_example_ratio: float = 10.0  # ratio of negative to positive examples
-    # note: real-world ratio is ~41:1 illegal to legal (out of 8415 possible rectangles, ~200 are legal)
-    # using 10:1 as a balance:
-    # - much higher than 2:1 (which still struggled with 20% legality in GRPO)
-    # - still less than 41:1 to avoid making model overly conservative
-    # - combined with negative_loss_weight (5.0) should teach strong legality
-    # if 10:1 isn't enough, can increase further (e.g., 20:1 or even 41:1)
-    negative_loss_weight: float = 5.0  # weight for negative example loss (increased from 2.0 for stronger penalty)
+    negative_example_ratio: float = 1.0  # reduced from 10.0 - set-based losses handle most of the work
+    negative_loss_weight: float = 2.0  # reduced from 5.0 - set-based losses are primary
+    
+    # set-based legality losses (penalize ALL illegal actions simultaneously)
+    illegal_mass_alpha: float = 2.0  # linear penalty on sum of illegal probabilities
+    illegal_mass_beta: float = 3.0  # squared penalty on sum of illegal probabilities (stronger gradients)
+    topk_illegal_k: int = 10  # number of top illegal actions to penalize
+    topk_illegal_delta: float = 5.0  # weight for top-K illegal loss
+    legal_mass_bonus_zeta: float = 0.5  # bonus for high probability on legal actions
+    
+    # curriculum learning
+    curriculum_legal_only_epochs: int = 1  # start with legal-only masks for stability
+    use_curriculum: bool = True  # enable curriculum learning
     
     # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
-    checkpoint_interval: int = 2
+    checkpoint_interval: int = 5
 
 
 def anchor_to_flat_idx(r1: int, c1: int) -> int:
@@ -472,6 +479,8 @@ def generate_negatives_for_positive(
                         'action': torch.tensor(illegal_anchor_idx, dtype=torch.long),
                         'mask': positive_example['mask'].clone(),
                         'is_positive': False,
+                        'legal_anchors_set': legal_anchors_set.copy(),  # needed for set-based losses
+                        'phase': 0,
                     })
     else:
         # Phase-1: generate negative extents
@@ -496,6 +505,8 @@ def generate_negatives_for_positive(
                             'mask': positive_example['mask'].clone(),
                             'anchor': positive_example['anchor'].clone(),
                             'is_positive': False,
+                            'legal_extents_set': legal_extents_set.copy(),  # needed for set-based losses
+                            'phase': 1,
                         })
     
     return negatives
@@ -508,27 +519,44 @@ def compute_sft_loss(
     masks: torch.Tensor,
     is_positive: Optional[torch.Tensor] = None,
     negative_loss_weight: float = 2.0,
+    legal_actions_sets: Optional[List[set]] = None,
+    illegal_mass_alpha: float = 2.0,
+    illegal_mass_beta: float = 3.0,
+    topk_illegal_k: int = 10,
+    topk_illegal_delta: float = 5.0,
+    legal_mass_bonus_zeta: float = 0.5,
+    use_set_based_losses: bool = True,
 ) -> Tuple[torch.Tensor, Dict]:
-    """Compute SFT loss. Masks can be sparse (only legal actions) or contiguous
+    """Compute SFT loss with set-based legality losses
     
     For positive examples: standard cross-entropy to maximize probability of correct (legal) action
     For negative examples: penalize high probability on illegal action using -log(1 - prob(illegal))
-    This ensures the model learns to avoid illegal actions rather than being encouraged to predict them.
+    
+    Set-based losses (when use_set_based_losses=True):
+    - Illegal mass loss: penalize sum of probabilities on ALL illegal actions
+    - Top-K illegal loss: penalize top-K illegal actions by probability
+    - Legal mass bonus: reward high probability on legal actions
     """
     logits, _ = policy(obs, masks)  # [batch_size, 170]
     
     # compute loss for each sample
-    # masks may be sparse (True only at legal extent indices) or contiguous
     losses = []
+    set_based_losses = []  # illegal mass, top-k, legal bonus
     correct = 0
     total = 0
-    negative_correct = 0  # for negative examples: correct = model does NOT predict illegal action
+    negative_correct = 0
     negative_total = 0
+    
+    # metrics for set-based losses
+    illegal_mass_sum = 0.0
+    topk_illegal_sum = 0.0
+    legal_mass_sum = 0.0
+    set_based_count = 0
     
     for b in range(obs.size(0)):
         mask = masks[b]  # [170]
         valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [valid_count]
-        # ensure valid_indices is 1D (squeeze might make it 0D if single element)
+        # ensure valid_indices is 1D
         if valid_indices.dim() == 0:
             valid_indices = valid_indices.unsqueeze(0)
         valid_count = valid_indices.numel()
@@ -541,40 +569,83 @@ def compute_sft_loss(
         action = actions[b].item()
         
         # map action index to position in valid_indices
-        # action is the original extent index, need to find its position in valid_indices
         action_pos = (valid_indices == action).nonzero(as_tuple=False)
         if action_pos.numel() == 0:
-            # action not in valid set (shouldn't happen, but handle gracefully)
             continue
         if action_pos.numel() > 1:
-            # multiple matches (shouldn't happen - valid_indices should be unique)
-            # take first match
             action_compact = action_pos[0].item()
         else:
-            # single match - squeeze to scalar and get item
             action_compact = action_pos.squeeze().item()
         
-        # check if this is a negative example (needed before computing loss)
+        # check if this is a negative example
         is_neg = is_positive is not None and not is_positive[b].item() if is_positive is not None else False
         
-        # compute loss differently for positive vs negative examples
+        # compute probabilities over valid actions
+        probs = F.softmax(valid_logits, dim=0)  # [valid_count]
+        
+        # compute set-based losses if enabled and we have legal actions info
+        if use_set_based_losses and legal_actions_sets is not None and b < len(legal_actions_sets):
+            legal_actions_set = legal_actions_sets[b]
+            # convert valid_indices to set for fast lookup
+            valid_indices_set = set(valid_indices.cpu().numpy().tolist())
+            
+            # identify legal vs illegal actions in valid set
+            legal_valid_indices = []
+            illegal_valid_indices = []
+            for i, orig_idx in enumerate(valid_indices.cpu().numpy()):
+                if orig_idx in legal_actions_set:
+                    legal_valid_indices.append(i)
+                else:
+                    illegal_valid_indices.append(i)
+            
+            # illegal mass loss: sum of probabilities on all illegal actions
+            if illegal_valid_indices:
+                illegal_probs = probs[illegal_valid_indices]
+                illegal_mass = illegal_probs.sum()
+                illegal_mass_sum += illegal_mass.item()
+                
+                # linear + squared penalty
+                illegal_mass_loss = (illegal_mass_alpha * illegal_mass + 
+                                    illegal_mass_beta * (illegal_mass ** 2))
+                set_based_losses.append(illegal_mass_loss)
+                
+                # top-K illegal loss: penalize top-K illegal actions by probability
+                # L_topk = δ · sum over top-K of −log(1 − p_illegal_k)
+                if len(illegal_valid_indices) > 0:
+                    topk_k = min(topk_illegal_k, len(illegal_valid_indices))
+                    topk_illegal_probs, _ = torch.topk(illegal_probs, topk_k)
+                    topk_illegal_sum += topk_illegal_probs.sum().item()
+                    # compute −log(1 − p) for each top-K illegal action, then sum
+                    epsilon = 1e-8
+                    topk_illegal_probs_clamped = torch.clamp(topk_illegal_probs, min=epsilon, max=1.0 - epsilon)
+                    topk_log_penalties = -torch.log1p(-topk_illegal_probs_clamped)  # -log(1 - p)
+                    topk_loss = topk_illegal_delta * topk_log_penalties.sum()
+                    set_based_losses.append(topk_loss)
+            
+            # legal mass bonus: reward high probability on legal actions
+            if legal_valid_indices:
+                legal_probs = probs[legal_valid_indices]
+                legal_mass = legal_probs.sum()
+                legal_mass_sum += legal_mass.item()
+                # bonus = -zeta * log(legal_mass + epsilon) to encourage high legal mass
+                epsilon = 1e-8
+                legal_bonus = -legal_mass_bonus_zeta * torch.log(legal_mass + epsilon)
+                set_based_losses.append(legal_bonus)
+            
+            set_based_count += 1
+        
+        # compute standard loss (positive/negative example loss)
         if is_neg:
             # for negative examples: penalize high probability on the illegal action
-            # use negative log of (1 - prob(illegal)) to push probability down
             log_probs = F.log_softmax(valid_logits, dim=0)
             illegal_log_prob = log_probs[action_compact]
-            # loss = -log(1 - exp(illegal_log_prob)) = -log(1 - prob(illegal))
-            # use numerical stability: log(1 - exp(x)) = log1p(-exp(x))
             illegal_prob = torch.exp(illegal_log_prob)
-            # clamp to avoid numerical issues
             illegal_prob = torch.clamp(illegal_prob, min=1e-8, max=1.0 - 1e-8)
-            # stronger loss: combine log penalty with squared penalty for better gradients
-            # when prob is low, log term has weak gradients, but squared term still provides signal
             log_penalty = -torch.log1p(-illegal_prob)
             squared_penalty = illegal_prob ** 2
             loss = (log_penalty + squared_penalty) * negative_loss_weight
         else:
-            # for positive examples: standard cross-entropy to maximize probability of correct action
+            # for positive examples: standard cross-entropy
             loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
         losses.append(loss)
         
@@ -583,25 +654,32 @@ def compute_sft_loss(
         pred_action_original = valid_indices[pred_action_compact].item()
         
         if is_neg:
-            # for negative examples: correct = model does NOT predict the illegal action
             negative_total += 1
             if pred_action_original != action:
                 negative_correct += 1
         else:
-            # for positive examples: correct = model predicts the correct legal action
             total += 1
             if pred_action_original == action:
                 correct += 1
     
+    # combine standard losses and set-based losses
     if len(losses) == 0:
-        # return zero loss if no valid samples
         loss = torch.tensor(0.0, device=obs.device, requires_grad=True)
-        accuracy = 0.0
-        negative_accuracy = 0.0
     else:
-        loss = torch.stack(losses).mean()
-        accuracy = correct / total if total > 0 else 0.0
-        negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
+        standard_loss = torch.stack(losses).mean()
+        if set_based_losses:
+            set_based_loss = torch.stack(set_based_losses).mean()
+            loss = standard_loss + set_based_loss
+        else:
+            loss = standard_loss
+    
+    accuracy = correct / total if total > 0 else 0.0
+    negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
+    
+    # compute average metrics
+    avg_illegal_mass = illegal_mass_sum / set_based_count if set_based_count > 0 else 0.0
+    avg_topk_illegal = topk_illegal_sum / set_based_count if set_based_count > 0 else 0.0
+    avg_legal_mass = legal_mass_sum / set_based_count if set_based_count > 0 else 0.0
     
     info = {
         'loss': loss.item(),
@@ -609,6 +687,9 @@ def compute_sft_loss(
         'negative_accuracy': negative_accuracy,
         'positive_count': total,
         'negative_count': negative_total,
+        'illegal_mass': avg_illegal_mass,
+        'topk_illegal': avg_topk_illegal,
+        'legal_mass': avg_legal_mass,
     }
     
     return loss, info
@@ -629,8 +710,18 @@ def train(config: Config):
             "lr": config.lr,
             "weight_decay": config.weight_decay,
             "seed": config.seed,
+            "include_negative_examples": config.include_negative_examples,
+            "negative_example_ratio": config.negative_example_ratio,
+            "negative_loss_weight": config.negative_loss_weight,
+            "illegal_mass_alpha": config.illegal_mass_alpha,
+            "illegal_mass_beta": config.illegal_mass_beta,
+            "topk_illegal_k": config.topk_illegal_k,
+            "topk_illegal_delta": config.topk_illegal_delta,
+            "legal_mass_bonus_zeta": config.legal_mass_bonus_zeta,
+            "use_curriculum": config.use_curriculum,
+            "curriculum_legal_only_epochs": config.curriculum_legal_only_epochs,
         },
-        tags=["sft", "fruit-box", "supervised"],
+        tags=["sft", "fruit-box", "supervised", "set-based-losses"],
     )
     print("Wandb initialized!")
     
@@ -668,6 +759,14 @@ def train(config: Config):
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
+        # curriculum learning: use legal-only masks for first N epochs
+        use_legal_only_masks = (config.use_curriculum and 
+                               epoch < config.curriculum_legal_only_epochs)
+        if use_legal_only_masks:
+            print(f"  Curriculum: Using legal-only masks (epoch {epoch + 1} < {config.curriculum_legal_only_epochs})")
+        else:
+            print(f"  Curriculum: Using all-geometric masks with set-based losses")
+        
         # combine Phase-0 and Phase-1 positive examples only
         all_positive_data = phase0_data + phase1_data
         random.shuffle(all_positive_data)
@@ -683,7 +782,7 @@ def train(config: Config):
         batch_actions_for_logging = None
         batch_masks_for_logging = None
         
-        # calculate batch composition: if ratio=10:1, batch_size=128, then ~11 positives, ~117 negatives
+        # calculate batch composition: if ratio=1:1, batch_size=128, then ~64 positives, ~64 negatives
         if config.include_negative_examples:
             ratio = config.negative_example_ratio
             positive_per_batch = max(1, int(config.batch_size / (ratio + 1)))
@@ -715,20 +814,53 @@ def train(config: Config):
             # shuffle to mix positives and negatives
             random.shuffle(batch_data)
             
-            # stack batches (masks already padded to 170)
+            # extract legal actions sets for set-based losses
+            legal_actions_sets = []
+            for d in batch_data:
+                if d.get('phase') == 0:
+                    # Phase-0: legal anchors
+                    legal_actions_sets.append(d.get('legal_anchors_set', set()))
+                else:
+                    # Phase-1: legal extents
+                    legal_actions_sets.append(d.get('legal_extents_set', set()))
+            
+            # update masks based on curriculum learning
+            if use_legal_only_masks:
+                # curriculum phase: use legal-only masks (reconstruct from legal sets)
+                updated_masks = []
+                for i, d in enumerate(batch_data):
+                    mask = torch.zeros(170, dtype=torch.bool)
+                    legal_set = legal_actions_sets[i]
+                    for legal_idx in legal_set:
+                        if legal_idx < 170:
+                            mask[legal_idx] = True
+                    updated_masks.append(mask)
+                batch_masks = torch.stack(updated_masks).to(device)
+            else:
+                # full phase: use all-geometric masks (already in batch_data)
+                batch_masks = torch.stack([
+                    d['mask'] if d['mask'].shape[0] == 170 
+                    else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
+                    for d in batch_data
+                ]).to(device)
+            
+            # stack batches
             batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
             batch_actions = torch.stack([d['action'] for d in batch_data]).to(device)
-            batch_masks = torch.stack([
-                d['mask'] if d['mask'].shape[0] == 170 
-                else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
-                for d in batch_data
-            ]).to(device)
             batch_is_positive = torch.tensor([d.get('is_positive', True) for d in batch_data], dtype=torch.bool).to(device)
             
-            # forward pass
+            # forward pass with set-based losses (only when not in curriculum phase)
+            use_set_based = not use_legal_only_masks
             loss, info = compute_sft_loss(
                 policy, batch_obs, batch_actions, batch_masks, batch_is_positive,
-                negative_loss_weight=config.negative_loss_weight
+                negative_loss_weight=config.negative_loss_weight,
+                legal_actions_sets=legal_actions_sets if use_set_based else None,
+                illegal_mass_alpha=config.illegal_mass_alpha,
+                illegal_mass_beta=config.illegal_mass_beta,
+                topk_illegal_k=config.topk_illegal_k,
+                topk_illegal_delta=config.topk_illegal_delta,
+                legal_mass_bonus_zeta=config.legal_mass_bonus_zeta,
+                use_set_based_losses=use_set_based,
             )
             
             # backward pass
@@ -754,10 +886,17 @@ def train(config: Config):
         total_positive = sum(d.get('positive_count', 0) for d in epoch_losses)
         total_negative = sum(d.get('negative_count', 0) for d in epoch_losses)
         
+        # set-based loss metrics
+        avg_illegal_mass = np.mean([d.get('illegal_mass', 0.0) for d in epoch_losses])
+        avg_topk_illegal = np.mean([d.get('topk_illegal', 0.0) for d in epoch_losses])
+        avg_legal_mass = np.mean([d.get('legal_mass', 0.0) for d in epoch_losses])
+        
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
             print(f"  Negative accuracy (avoiding illegal actions): {avg_negative_accuracy:.4f}")
+        if not use_legal_only_masks:
+            print(f"  Set-based losses: Illegal mass={avg_illegal_mass:.4f}, Top-K illegal={avg_topk_illegal:.4f}, Legal mass={avg_legal_mass:.4f}")
         
         # log example moves
         if batch_data_for_logging is not None:
@@ -782,6 +921,10 @@ def train(config: Config):
             log_dict["train/negative_accuracy"] = avg_negative_accuracy
             log_dict["train/positive_count"] = total_positive
             log_dict["train/negative_count"] = total_negative
+        if not use_legal_only_masks:
+            log_dict["train/illegal_mass"] = avg_illegal_mass
+            log_dict["train/topk_illegal"] = avg_topk_illegal
+            log_dict["train/legal_mass"] = avg_legal_mass
         wandb.log(log_dict)
         
         # checkpoint

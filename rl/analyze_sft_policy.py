@@ -16,6 +16,38 @@ from fruit_box import Sum10Env
 from rl.train_sft import build_observation, flat_idx_to_anchor, flat_idx_to_extent
 
 
+def load_checkpoint_from_wandb(artifact_path: str) -> str:
+    """Download checkpoint from wandb artifact and return local path.
+    
+    Args:
+        artifact_path: Wandb artifact path (e.g., 'djdumpling-yale/fruit-box-sft/sft-checkpoint-epoch-40:v5')
+    
+    Returns:
+        Local path to the checkpoint file
+    """
+    import wandb
+    
+    print(f"Downloading wandb artifact: {artifact_path}")
+    # Initialize wandb run to access artifacts
+    run = wandb.init()
+    artifact = run.use_artifact(artifact_path, type='model')
+    artifact_dir = artifact.download()
+    
+    # Find the checkpoint file in the artifact directory
+    artifact_path_obj = Path(artifact_dir)
+    checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+    
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+    
+    if len(checkpoint_files) > 1:
+        print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+    
+    checkpoint_path = str(checkpoint_files[0])
+    print(f"Downloaded checkpoint to: {checkpoint_path}")
+    return checkpoint_path
+
+
 def print_grid(grid: np.ndarray, title: str = "Grid"):
     """Print grid in a readable format"""
     print(f"\n{title}:")
@@ -460,7 +492,7 @@ def main():
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to SFT checkpoint (e.g., 'rl/checkpoints/policy_sft_epoch50.pt')"
+        help="Path to SFT checkpoint or wandb artifact (e.g., 'rl/checkpoints/policy_sft_epoch50.pt' or 'djdumpling-yale/fruit-box-sft/sft-checkpoint-epoch-40:v5')"
     )
     parser.add_argument(
         "--dataset",
@@ -511,6 +543,12 @@ def main():
     
     args = parser.parse_args()
     
+    # handle wandb artifact download if needed
+    checkpoint_path = args.checkpoint
+    if args.checkpoint.startswith("djdumpling") or ("/" in args.checkpoint and ":" in args.checkpoint):
+        # Looks like a wandb artifact path
+        checkpoint_path = load_checkpoint_from_wandb(args.checkpoint)
+    
     device = None
     if args.device:
         device = torch.device(args.device)
@@ -518,7 +556,7 @@ def main():
     if args.random_grid:
         # run on random grid
         run_policy_on_random_grid(
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint_path,
             num_moves=args.num_moves,
             seed=args.random_seed,
             device=device,
@@ -527,7 +565,7 @@ def main():
     else:
         # run on dataset grids
         analyze_sft_policy(
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint_path,
             dataset_name=args.dataset,
             dataset_split=args.dataset_split,
             num_grids=args.num_grids,

@@ -28,6 +28,38 @@ def flat_idx_to_extent(r1: int, c1: int, idx: int):
     return (r2, c2)
 
 
+def load_checkpoint_from_wandb(artifact_path: str) -> str:
+    """Download checkpoint from wandb artifact and return local path.
+    
+    Args:
+        artifact_path: Wandb artifact path (e.g., 'djdumpling-yale/fruit-box-sft/sft-checkpoint-epoch-40:v5')
+    
+    Returns:
+        Local path to the checkpoint file
+    """
+    import wandb
+    
+    print(f"Downloading wandb artifact: {artifact_path}")
+    # Initialize wandb run to access artifacts
+    run = wandb.init()
+    artifact = run.use_artifact(artifact_path, type='model')
+    artifact_dir = artifact.download()
+    
+    # Find the checkpoint file in the artifact directory
+    artifact_path_obj = Path(artifact_dir)
+    checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+    
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+    
+    if len(checkpoint_files) > 1:
+        print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+    
+    checkpoint_path = str(checkpoint_files[0])
+    print(f"Downloaded checkpoint to: {checkpoint_path}")
+    return checkpoint_path
+
+
 def test_policy_with_all_masks(checkpoint_path: str, num_grids: int = 10, seed_start: int = 20000):
     """Test SFT policy using all geometrically valid masks (not just legal-only)"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,10 +172,16 @@ def test_policy_with_all_masks(checkpoint_path: str, num_grids: int = 10, seed_s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to SFT checkpoint")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to SFT checkpoint or wandb artifact")
     parser.add_argument("--num_grids", type=int, default=10, help="Number of grids to test")
     parser.add_argument("--seed_start", type=int, default=20000, help="Starting seed")
     args = parser.parse_args()
     
-    test_policy_with_all_masks(args.checkpoint, args.num_grids, args.seed_start)
+    # handle wandb artifact download if needed
+    checkpoint_path = args.checkpoint
+    if args.checkpoint.startswith("djdumpling") or ("/" in args.checkpoint and ":" in args.checkpoint):
+        # Looks like a wandb artifact path
+        checkpoint_path = load_checkpoint_from_wandb(args.checkpoint)
+    
+    test_policy_with_all_masks(checkpoint_path, args.num_grids, args.seed_start)
 
