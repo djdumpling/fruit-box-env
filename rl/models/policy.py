@@ -50,8 +50,9 @@ class CNNPolicy(nn.Module):
         self.fc = nn.Linear(self.flattened_size, 256)
         self.ln = nn.LayerNorm(256)
         
-        # policy head
-        self.policy_head = nn.Linear(256, action_dim)
+        # separate policy heads for Phase-0 (anchor selection) and Phase-1 (extent selection)
+        self.phase0_head = nn.Linear(256, action_dim)  # anchor selection
+        self.phase1_head = nn.Linear(256, action_dim)  # extent selection
         
         # value head
         self.value_head = nn.Linear(256, 1)
@@ -65,6 +66,7 @@ class CNNPolicy(nn.Module):
         
         Args:
             obs: [batch_size, 4, 10, 17] observation tensor
+                Channel 3 (phase_mask) indicates phase: 0.0 = Phase-0, 1.0 = Phase-1
             action_mask: [batch_size, action_dim] binary mask (1 for valid actions)
         
         Returns:
@@ -77,8 +79,22 @@ class CNNPolicy(nn.Module):
         x = F.gelu(self.fc(x))  # [batch, 256]
         x = self.ln(x)  # [batch, 256] - LayerNorm before heads
         
-        # policy logits
-        logits = self.policy_head(x)  # [batch, action_dim]
+        # determine phase from observation (channel 3, any pixel will do)
+        # phase_mask is 0.0 for Phase-0, 1.0 for Phase-1
+        phase_indicator = obs[:, 3, 0, 0]  # [batch] - take any pixel from phase mask channel
+        is_phase1 = phase_indicator > 0.5  # [batch] - True for Phase-1
+        
+        # use separate heads based on phase
+        phase0_logits = self.phase0_head(x)  # [batch, action_dim]
+        phase1_logits = self.phase1_head(x)  # [batch, action_dim]
+        
+        # select logits based on phase
+        # use torch.where to select: if is_phase1, use phase1_logits, else phase0_logits
+        logits = torch.where(
+            is_phase1.unsqueeze(-1),  # [batch, 1] - broadcast to action_dim
+            phase1_logits,
+            phase0_logits
+        )  # [batch, action_dim]
         
         # apply action mask
         if action_mask is not None:

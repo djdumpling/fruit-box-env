@@ -59,6 +59,13 @@ class Config:
     min_extent_size: int = 2  # minimum (dr, dc) size to include early (e.g., max(dr, dc) >= 2)
     max_extent_size_early: int = 4  # maximum extent size in early curriculum (e.g., max(dr, dc) <= 4)
     
+    # reward-weighted sampling and context-aware loss
+    use_reward_weighted_sampling: bool = True  # sample examples with probability proportional to reward^alpha
+    reward_sampling_alpha: float = 1.2  # exponent for reward-weighted sampling (higher = more emphasis on high rewards)
+    use_context_aware_reward_weighting: bool = True  # weight loss by reward normalized by game state category
+    context_aware_early_threshold: float = 0.5  # grid density threshold for early-game (dense) vs late-game (sparse)
+    context_aware_trajectory_threshold: int = 30  # step threshold for early-game vs late-game
+    
     # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
@@ -406,6 +413,11 @@ def load_and_process_dataset(
                 print(f"  Round-trip check: ({r2},{c2}) -> {extent_to_flat_idx(r1, c1, r2, c2)} -> ({recovered_r2},{recovered_c2})")
                 debug_count += 1
             
+            # compute reward, step number, and grid density for context-aware weighting
+            reward = step.get("reward", 0)  # cells cleared by this move
+            step_num = step.get("step", 0)  # step number in trajectory
+            grid_density = (grid > 0).sum() / (10 * 17)  # fraction of non-zero cells (0.0 to 1.0)
+            
             # phase-0: select anchor (r1, c1)
             # only include anchors that have at least one legal extent
             # cache legal anchors per grid to avoid recomputation
@@ -442,6 +454,9 @@ def load_and_process_dataset(
                 'grid': grid.copy(),  # needed for negative generation
                 'legal_anchors_set': legal_anchors_set.copy(),  # needed for negative generation
                 'phase': 0,
+                'reward': reward,  # for reward-weighted sampling and loss
+                'step_num': step_num,  # for trajectory position weighting
+                'grid_density': grid_density,  # for context-aware reward weighting
             })
             
             # phase-1: select extent (r2, c2) given anchor (r1, c1)
@@ -500,6 +515,9 @@ def load_and_process_dataset(
                 'c1': c1,  # needed for negative generation
                 'legal_extents_set': legal_extents_set.copy(),  # needed for negative generation
                 'phase': 1,
+                'reward': reward,  # for reward-weighted sampling and loss
+                'step_num': step_num,  # for trajectory position weighting
+                'grid_density': grid_density,  # for context-aware reward weighting
             })
     
     # only positive examples are stored (negatives generated on-the-fly)
@@ -687,6 +705,12 @@ def compute_sft_loss(
     topk_illegal_delta: float = 5.0,
     legal_mass_bonus_zeta: float = 0.5,
     use_set_based_losses: bool = True,
+    rewards: Optional[torch.Tensor] = None,  # [batch_size] reward for each example
+    grid_densities: Optional[torch.Tensor] = None,  # [batch_size] grid density for each example
+    step_nums: Optional[torch.Tensor] = None,  # [batch_size] step number for each example
+    use_context_aware_reward_weighting: bool = True,
+    context_aware_early_threshold: float = 0.5,
+    context_aware_trajectory_threshold: int = 20,
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute SFT loss with set-based legality losses
     
@@ -807,7 +831,64 @@ def compute_sft_loss(
             loss = (log_penalty + squared_penalty) * negative_loss_weight
         else:
             # for positive examples: standard cross-entropy
-            loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
+            base_loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
+            
+            # apply context-aware reward weighting if enabled
+            if use_context_aware_reward_weighting and rewards is not None and b < len(rewards):
+                reward = rewards[b].item() if isinstance(rewards, torch.Tensor) else rewards[b]
+                grid_density = grid_densities[b].item() if grid_densities is not None and b < len(grid_densities) else None
+                step_num = step_nums[b].item() if step_nums is not None and b < len(step_nums) else None
+                
+                # categorize game state: early-game (dense) vs late-game (sparse)
+                # use both grid density and trajectory position for robustness
+                is_early_game = True
+                if grid_density is not None:
+                    is_early_game = is_early_game and (grid_density > context_aware_early_threshold)
+                if step_num is not None:
+                    is_early_game = is_early_game and (step_num < context_aware_trajectory_threshold)
+                
+                # compute context-aware weight
+                # for early-game: normalize by max reward in early-game category
+                # for late-game: normalize by max reward in late-game category
+                # we'll compute max rewards per category from the batch
+                if grid_densities is not None and step_nums is not None:
+                    # find max reward in the same category within this batch
+                    category_rewards = []
+                    for i in range(obs.size(0)):
+                        if i < len(rewards) and i < len(grid_densities) and i < len(step_nums):
+                            other_density = grid_densities[i].item() if isinstance(grid_densities, torch.Tensor) else grid_densities[i]
+                            other_step = step_nums[i].item() if isinstance(step_nums, torch.Tensor) else step_nums[i]
+                            other_reward = rewards[i].item() if isinstance(rewards, torch.Tensor) else rewards[i]
+                            
+                            other_is_early = (other_density > context_aware_early_threshold) and (other_step < context_aware_trajectory_threshold)
+                            if other_is_early == is_early_game:
+                                category_rewards.append(other_reward)
+                    
+                    if category_rewards:
+                        max_reward_in_category = max(category_rewards)
+                        # weight = reward / max_reward_in_category (normalized to [0, 1])
+                        # add small epsilon to avoid division by zero
+                        reward_weight = reward / (max_reward_in_category + 1e-8)
+                        # clamp to reasonable range [0.1, 2.0] to avoid extreme weights
+                        reward_weight = max(0.1, min(2.0, reward_weight))
+                    else:
+                        # fallback: use reward directly (normalized by max in batch)
+                        max_reward_in_batch = max([r.item() if isinstance(r, torch.Tensor) else r for r in rewards[:obs.size(0)]])
+                        reward_weight = reward / (max_reward_in_batch + 1e-8)
+                        reward_weight = max(0.1, min(2.0, reward_weight))
+                else:
+                    # fallback: simple normalization by max reward in batch
+                    if isinstance(rewards, torch.Tensor):
+                        max_reward_in_batch = rewards[:obs.size(0)].max().item()
+                    else:
+                        max_reward_in_batch = max(rewards[:obs.size(0)])
+                    reward_weight = reward / (max_reward_in_batch + 1e-8)
+                    reward_weight = max(0.1, min(2.0, reward_weight))
+                
+                loss = base_loss * reward_weight
+            else:
+                loss = base_loss
+            
         losses.append(loss)
         
         # compute accuracy
@@ -884,6 +965,11 @@ def train(config: Config):
             "extent_curriculum_epochs": config.extent_curriculum_epochs,
             "min_extent_size": config.min_extent_size,
             "max_extent_size_early": config.max_extent_size_early,
+            "use_reward_weighted_sampling": config.use_reward_weighted_sampling,
+            "reward_sampling_alpha": config.reward_sampling_alpha,
+            "use_context_aware_reward_weighting": config.use_context_aware_reward_weighting,
+            "context_aware_early_threshold": config.context_aware_early_threshold,
+            "context_aware_trajectory_threshold": config.context_aware_trajectory_threshold,
         },
         tags=["sft", "fruit-box", "supervised", "set-based-losses"],
     )
@@ -933,7 +1019,50 @@ def train(config: Config):
         
         # combine Phase-0 and Phase-1 positive examples only
         all_positive_data = phase0_data + phase1_data
-        random.shuffle(all_positive_data)
+        
+        # apply reward-weighted sampling if enabled
+        if config.use_reward_weighted_sampling:
+            # compute sampling weights: reward^alpha, but balance with trajectory position
+            # to avoid over-sampling late-game moves
+            weights = []
+            for example in all_positive_data:
+                reward = example.get('reward', 1)
+                step_num = example.get('step_num', 0)
+                
+                # reward weight: higher reward = higher weight
+                reward_weight = (reward + 1) ** config.reward_sampling_alpha  # +1 to avoid 0 weight
+                
+                # trajectory position weight: balance early/late game
+                # early-game (step < threshold): weight = 1.0
+                # late-game (step >= threshold): weight = 2.0 (oversample to compensate for rarity)
+                if step_num < config.context_aware_trajectory_threshold:
+                    position_weight = 1.0
+                else:
+                    position_weight = 2.0  # oversample late-game moves
+                
+                # combined weight: reward-weighted but balanced by position
+                combined_weight = reward_weight * position_weight
+                weights.append(combined_weight)
+            
+            # normalize weights to probabilities
+            total_weight = sum(weights)
+            if total_weight > 0:
+                probabilities = [w / total_weight for w in weights]
+                # sample with replacement using weights (for each epoch, we want to see high-reward examples more)
+                # but we'll still iterate through all examples, just with weighted selection
+                sampled_indices = np.random.choice(
+                    len(all_positive_data),
+                    size=len(all_positive_data),  # same size, but weighted
+                    replace=True,
+                    p=probabilities
+                )
+                all_positive_data = [all_positive_data[i] for i in sampled_indices]
+                print(f"  Applied reward-weighted sampling (alpha={config.reward_sampling_alpha}) with trajectory balancing")
+            else:
+                random.shuffle(all_positive_data)
+        else:
+            random.shuffle(all_positive_data)
+        
         print(f"  Training on {len(all_positive_data)} positive examples ({len(phase0_data)} Phase-0 + {len(phase1_data)} Phase-1)")
         if config.include_negative_examples:
             print(f"  Generating negatives on-the-fly with ratio {config.negative_example_ratio}:1")
@@ -1071,15 +1200,34 @@ def train(config: Config):
             else:
                 # full phase: use all-geometric masks (already in batch_data)
                 batch_masks = torch.stack([
-                d['mask'] if d['mask'].shape[0] == 170 
-                else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
-                for d in batch_data
-            ]).to(device)
+                    d["mask"] if d["mask"].shape[0] == 170 
+                    else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
+                    for d in batch_data
+                ]).to(device)
             
             # stack batches
             batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
             batch_actions = torch.stack([d['action'] for d in batch_data]).to(device)
             batch_is_positive = torch.tensor([d.get('is_positive', True) for d in batch_data], dtype=torch.bool).to(device)
+            
+            # extract reward and context information for context-aware weighting
+            # negatives don't have reward/context (they're synthetic), so use defaults
+            batch_rewards = None
+            batch_grid_densities = None
+            batch_step_nums = None
+            if config.use_context_aware_reward_weighting:
+                batch_rewards = torch.tensor([
+                    d.get('reward', 0) if d.get('is_positive', True) else 0 
+                    for d in batch_data
+                ], dtype=torch.float32).to(device)
+                batch_grid_densities = torch.tensor([
+                    d.get('grid_density', 0.5) if d.get('is_positive', True) else 0.5 
+                    for d in batch_data
+                ], dtype=torch.float32).to(device)
+                batch_step_nums = torch.tensor([
+                    d.get('step_num', 0) if d.get('is_positive', True) else 0 
+                    for d in batch_data
+                ], dtype=torch.long).to(device)
             
             # forward pass with set-based losses (only when not in curriculum phase)
             use_set_based = not use_legal_only_masks
@@ -1093,6 +1241,12 @@ def train(config: Config):
                 topk_illegal_delta=config.topk_illegal_delta,
                 legal_mass_bonus_zeta=config.legal_mass_bonus_zeta,
                 use_set_based_losses=use_set_based,
+                rewards=batch_rewards,
+                grid_densities=batch_grid_densities,
+                step_nums=batch_step_nums,
+                use_context_aware_reward_weighting=config.use_context_aware_reward_weighting,
+                context_aware_early_threshold=config.context_aware_early_threshold,
+                context_aware_trajectory_threshold=config.context_aware_trajectory_threshold,
             )
             
             # backward pass
@@ -1217,7 +1371,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box")
+    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint_interval", type=int, default=20)
