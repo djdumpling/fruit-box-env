@@ -5,12 +5,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+from typing import List, Optional
+
 import numpy as np
 import torch
 from rl.models.policy import CNNPolicy
 from rl.envs.sum10_env import Sum10GymEnv
 from rl.envs.split_wrapper import TwoPhaseWrapper
-from fruit_box import Sum10Env
+from fruit_box import Sum10Env, load_environment
 
 
 def flat_idx_to_anchor(idx: int):
@@ -60,8 +62,46 @@ def load_checkpoint_from_wandb(artifact_path: str) -> str:
     return checkpoint_path
 
 
-def test_policy_with_all_masks(checkpoint_path: str, num_grids: int = 10, seed_start: int = 20000):
-    """Test SFT policy using all geometrically valid masks (not just legal-only)"""
+def load_grids_from_loader(
+    dataset_name: str = "djdumpling/fruit-box-minimal-area",
+    dataset_split: str = "train",
+    num_grids: int = 10,
+    seed: Optional[int] = None,
+) -> List[np.ndarray]:
+    """Load initial grids using fruit_box.load_environment"""
+    env = load_environment(dataset_name=dataset_name, dataset_split=dataset_split, seed=seed)
+    dataset = env.dataset
+    
+    grids: List[np.ndarray] = []
+    seen_episodes = set()
+    for row in dataset:
+        info = row.get("info", {})
+        episode_id = info.get("episode_id")
+        if episode_id in seen_episodes:
+            continue
+        seen_episodes.add(episode_id)
+        
+        initial_grid = info.get("initial_grid")
+        if initial_grid is None:
+            continue
+        grids.append(np.array(initial_grid, dtype=np.uint8))
+        if len(grids) >= num_grids:
+            break
+    
+    if not grids:
+        raise RuntimeError("No grids loaded from dataset via load_environment()")
+    
+    if len(grids) < num_grids:
+        print(f"Warning: requested {num_grids} grids but only loaded {len(grids)} unique episodes")
+    
+    return grids
+
+
+def test_policy_with_all_masks(
+    checkpoint_path: str,
+    grids: List[np.ndarray],
+):
+    """Test SFT policy using all geometrically valid masks (not just legal-only) on dataset grids"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
@@ -75,13 +115,10 @@ def test_policy_with_all_masks(checkpoint_path: str, num_grids: int = 10, seed_s
     total_moves = 0
     valid_moves = 0
     
-    for grid_idx in range(num_grids):
-        seed = seed_start + grid_idx
-        np.random.seed(seed)
-        
-        # generate random grid
-        initial_grid = np.random.randint(1, 10, size=(10, 17), dtype=np.uint8)
-        
+    if not grids:
+        raise ValueError("No grids provided for evaluation.")
+    
+    for grid_idx, initial_grid in enumerate(grids):
         # create environments
         env = Sum10GymEnv(initial_grid=initial_grid.copy())
         wrapped_env = TwoPhaseWrapper(env, curriculum_legal_only=False, curriculum_updates=0)
@@ -174,7 +211,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to SFT checkpoint or wandb artifact")
     parser.add_argument("--num_grids", type=int, default=10, help="Number of grids to test")
-    parser.add_argument("--seed_start", type=int, default=20000, help="Starting seed")
+    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area", help="Dataset to load via fruit_box loader")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split")
+    parser.add_argument("--loader_seed", type=int, default=None, help="Seed passed to fruit_box.load_environment")
     args = parser.parse_args()
     
     # handle wandb artifact download if needed
@@ -183,5 +222,12 @@ if __name__ == "__main__":
         # Looks like a wandb artifact path
         checkpoint_path = load_checkpoint_from_wandb(args.checkpoint)
     
-    test_policy_with_all_masks(checkpoint_path, args.num_grids, args.seed_start)
+    grids = load_grids_from_loader(
+        dataset_name=args.dataset_name,
+        dataset_split=args.dataset_split,
+        num_grids=args.num_grids,
+        seed=args.loader_seed,
+    )
+    
+    test_policy_with_all_masks(checkpoint_path, grids)
 

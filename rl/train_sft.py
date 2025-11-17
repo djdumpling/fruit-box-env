@@ -731,6 +731,8 @@ def compute_sft_loss(
     total = 0
     negative_correct = 0
     negative_total = 0
+    legal_prediction_count = 0
+    total_prediction_count = 0
     
     # metrics for set-based losses
     illegal_mass_sum = 0.0
@@ -768,9 +770,12 @@ def compute_sft_loss(
         # compute probabilities over valid actions
         probs = F.softmax(valid_logits, dim=0)  # [valid_count]
         
-        # compute set-based losses if enabled and we have legal actions info
-        if use_set_based_losses and legal_actions_sets is not None and b < len(legal_actions_sets):
+        legal_actions_set = None
+        if legal_actions_sets is not None and b < len(legal_actions_sets):
             legal_actions_set = legal_actions_sets[b]
+
+        # compute set-based losses if enabled and we have legal actions info
+        if use_set_based_losses and legal_actions_set is not None:
             # convert valid_indices to set for fast lookup
             valid_indices_set = set(valid_indices.cpu().numpy().tolist())
             
@@ -903,6 +908,14 @@ def compute_sft_loss(
             total += 1
             if pred_action_original == action:
                 correct += 1
+
+        total_prediction_count += 1
+        if legal_actions_set is not None:
+            if pred_action_original in legal_actions_set:
+                legal_prediction_count += 1
+        else:
+            # during curriculum phase we only expose legal actions, so treat as legal
+            legal_prediction_count += 1
     
     # combine standard losses and set-based losses
     if len(losses) == 0:
@@ -932,6 +945,8 @@ def compute_sft_loss(
         'illegal_mass': avg_illegal_mass,
         'topk_illegal': avg_topk_illegal,
         'legal_mass': avg_legal_mass,
+        'legal_predictions': legal_prediction_count,
+        'total_predictions': total_prediction_count,
     }
     
     return loss, info
@@ -1057,6 +1072,8 @@ def train(config: Config):
                     p=probabilities
                 )
                 all_positive_data = [all_positive_data[i] for i in sampled_indices]
+                # shuffle after sampling so slices remain well-mixed and non-empty
+                random.shuffle(all_positive_data)
                 print(f"  Applied reward-weighted sampling (alpha={config.reward_sampling_alpha}) with trajectory balancing")
             else:
                 random.shuffle(all_positive_data)
@@ -1092,6 +1109,8 @@ def train(config: Config):
         for batch_idx, start in enumerate(tqdm(range(0, len(all_positive_data), positive_per_batch), desc="Training")):
             # sample positive examples for this batch
             candidate_positives = all_positive_data[start:start + positive_per_batch]
+            if not candidate_positives:
+                continue  # skip empty slices (can occur due to sampling)
             
             # apply extent-size curriculum filtering
             batch_positives = []
@@ -1170,6 +1189,9 @@ def train(config: Config):
                         batch_negatives.extend(negs[:remaining])
                         break
             
+            if not batch_positives:
+                continue  # nothing to train on this iteration
+
             # combine positives and negatives into batch
             batch_data = batch_positives + batch_negatives
             # shuffle to mix positives and negatives
@@ -1234,7 +1256,7 @@ def train(config: Config):
             loss, info = compute_sft_loss(
                 policy, batch_obs, batch_actions, batch_masks, batch_is_positive,
                 negative_loss_weight=config.negative_loss_weight,
-                legal_actions_sets=legal_actions_sets if use_set_based else None,
+                legal_actions_sets=legal_actions_sets,
                 illegal_mass_alpha=config.illegal_mass_alpha,
                 illegal_mass_beta=config.illegal_mass_beta,
                 topk_illegal_k=config.topk_illegal_k,
@@ -1269,6 +1291,9 @@ def train(config: Config):
         avg_loss = np.mean([d['loss'] for d in epoch_losses])
         avg_accuracy = np.mean([d['accuracy'] for d in epoch_losses])
         avg_negative_accuracy = np.mean([d.get('negative_accuracy', 0.0) for d in epoch_losses])
+        total_legal_predictions = sum(d.get('legal_predictions', 0) for d in epoch_losses)
+        total_predictions = sum(d.get('total_predictions', 0) for d in epoch_losses)
+        avg_legality_rate = (total_legal_predictions / total_predictions) if total_predictions > 0 else 0.0
         total_positive = sum(d.get('positive_count', 0) for d in epoch_losses)
         total_negative = sum(d.get('negative_count', 0) for d in epoch_losses)
         
@@ -1284,7 +1309,7 @@ def train(config: Config):
         avg_extent_size = np.mean(extent_sizes) if extent_sizes else 0.0
         max_extent_size = max(extent_sizes) if extent_sizes else 0
         
-        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
+        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}, Legality rate={avg_legality_rate:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
             print(f"  Negative accuracy (avoiding illegal actions): {avg_negative_accuracy:.4f}")
@@ -1312,6 +1337,7 @@ def train(config: Config):
             "epoch": epoch + 1,
             "train/loss": avg_loss,
             "train/accuracy": avg_accuracy,
+            "train/legality_rate": avg_legality_rate,
         }
         if total_negative > 0:
             log_dict["train/negative_accuracy"] = avg_negative_accuracy
