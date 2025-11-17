@@ -54,6 +54,11 @@ class Config:
     curriculum_legal_only_epochs: int = 1  # start with legal-only masks for stability
     use_curriculum: bool = True  # enable curriculum learning
     
+    # extent-size curriculum learning (focus on small extents early)
+    extent_curriculum_epochs: int = 20  # epochs to focus on small extents
+    min_extent_size: int = 2  # minimum (dr, dc) size to include early (e.g., max(dr, dc) >= 2)
+    max_extent_size_early: int = 4  # maximum extent size in early curriculum (e.g., max(dr, dc) <= 4)
+    
     # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
@@ -154,13 +159,21 @@ def compute_legal_anchors(grid: np.ndarray) -> set:
 
 
 def compute_legal_extents(grid: np.ndarray, r1: int, c1: int) -> set:
-    """Find all legal extents for a given anchor"""
+    """Find all legal extents for a given anchor
+    
+    Note: extent_idx=0 represents (dr=0, dc=0) which is never legal (single cell can't sum to 10),
+    so we skip it explicitly.
+    """
     temp_env = Sum10Env()
     temp_env.reset(grid=grid.copy())
     
     legal_extents_set = set()
     max_valid_count = (10 - r1) * (17 - c1)
     for extent_idx in range(max_valid_count):
+        # Skip extent_idx=0 (dr=0, dc=0) - single cell can never sum to 10
+        if extent_idx == 0:
+            continue
+        
         r2_test, c2_test = flat_idx_to_extent(r1, c1, extent_idx)
         # check if this extent sums to 10
         if temp_env.box_sum(r1, c1, r2_test, c2_test) == 10:
@@ -179,11 +192,125 @@ def compute_illegal_anchors(grid: np.ndarray, legal_anchors_set: set) -> set:
 
 
 def compute_illegal_extents(grid: np.ndarray, r1: int, c1: int, legal_extents_set: set) -> set:
-    """Find all geometrically valid extents that DON'T sum to 10"""
+    """Find all geometrically valid extents that DON'T sum to 10
+    
+    Note: Excludes extent_idx=0 (dr=0, dc=0) since single cell can never sum to 10.
+    """
     max_valid_count = (10 - r1) * (17 - c1)
     all_extents = set(range(max_valid_count))
     illegal_extents_set = all_extents - legal_extents_set
+    # Remove idx=0 (dr=0, dc=0) - single cell can never sum to 10
+    illegal_extents_set.discard(0)
     return illegal_extents_set
+
+
+def get_pareto_frontier_extents(legal_extents_set: set, r1: int, c1: int) -> List[Tuple[int, int, int]]:
+    """Find Pareto frontier: minimal (dr, dc) pairs that are legal
+    
+    Returns list of (dr, dc, extent_idx) tuples sorted by (dr, dc).
+    A pair (dr, dc) is on the frontier if no other legal pair (dr', dc') exists 
+    where dr' < dr AND dc' < dc.
+    """
+    frontier = []
+    for extent_idx in legal_extents_set:
+        r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
+        dr = r2 - r1
+        dc = c2 - c1
+        frontier.append((dr, dc, extent_idx))
+    
+    # Find minimal pairs: (dr, dc) is on frontier if no (dr', dc') with dr' < dr AND dc' < dc
+    frontier_minimal = []
+    for dr, dc, extent_idx in frontier:
+        is_minimal = True
+        for dr_other, dc_other, _ in frontier:
+            if dr_other < dr and dc_other < dc:
+                is_minimal = False
+                break
+        if is_minimal:
+            frontier_minimal.append((dr, dc, extent_idx))
+    
+    # Sort by (dr, dc) for consistency
+    frontier_minimal.sort()
+    return frontier_minimal
+
+
+def get_hard_negatives_near_frontier(
+    frontier: List[Tuple[int, int, int]], 
+    r1: int, 
+    c1: int, 
+    max_valid_count: int,
+    illegal_extents_set: set
+) -> set:
+    """Get hard negative extents just beyond or strictly smaller than Pareto frontier
+    
+    For each frontier extent (dr, dc):
+    - Beyond frontier: (dr+1, dc) and (dr, dc+1) - these sum > 10
+    - Strictly smaller: (dr-1, dc) if dr > 0, and (dr, dc-1) if dc > 0 - these sum < 10
+    
+    Returns set of hard negative extent indices.
+    
+    Note: Includes explicit bounds checking to prevent out-of-bounds extents.
+    """
+    hard_negatives = set()
+    
+    for dr, dc, _ in frontier:
+        # Beyond frontier: (dr+1, dc) and (dr, dc+1)
+        # These are larger in at least one dimension, so sum > 10
+        # Check bounds: r1 + dr + 1 < 10 AND c1 + dc < 17
+        if dr + 1 < (10 - r1) and c1 + dc < 17:
+            try:
+                r2_beyond = r1 + dr + 1
+                c2_beyond = c1 + dc
+                # Double-check bounds
+                if 0 <= r2_beyond < 10 and 0 <= c2_beyond < 17:
+                    idx_beyond_r = extent_to_flat_idx(r1, c1, r2_beyond, c2_beyond)
+                    if idx_beyond_r < max_valid_count and idx_beyond_r in illegal_extents_set:
+                        hard_negatives.add(idx_beyond_r)
+            except (ValueError, IndexError):
+                pass  # Invalid extent, skip
+        
+        # Check bounds: r1 + dr < 10 AND c1 + dc + 1 < 17
+        if r1 + dr < 10 and dc + 1 < (17 - c1):
+            try:
+                r2_beyond = r1 + dr
+                c2_beyond = c1 + dc + 1
+                # Double-check bounds
+                if 0 <= r2_beyond < 10 and 0 <= c2_beyond < 17:
+                    idx_beyond_c = extent_to_flat_idx(r1, c1, r2_beyond, c2_beyond)
+                    if idx_beyond_c < max_valid_count and idx_beyond_c in illegal_extents_set:
+                        hard_negatives.add(idx_beyond_c)
+            except (ValueError, IndexError):
+                pass  # Invalid extent, skip
+        
+        # Strictly smaller: (dr-1, dc) and (dr, dc-1)
+        # These are smaller in at least one dimension, so sum < 10
+        # Check bounds: dr > 0 AND r1 + dr - 1 < 10 AND c1 + dc < 17
+        if dr > 0 and r1 + dr - 1 < 10 and c1 + dc < 17:
+            try:
+                r2_smaller = r1 + dr - 1
+                c2_smaller = c1 + dc
+                # Double-check bounds
+                if 0 <= r2_smaller < 10 and 0 <= c2_smaller < 17:
+                    idx_smaller_r = extent_to_flat_idx(r1, c1, r2_smaller, c2_smaller)
+                    if idx_smaller_r < max_valid_count and idx_smaller_r in illegal_extents_set:
+                        hard_negatives.add(idx_smaller_r)
+            except (ValueError, IndexError):
+                pass  # Invalid extent, skip
+        
+        # Check bounds: dc > 0 AND r1 + dr < 10 AND c1 + dc - 1 < 17
+        if dc > 0 and r1 + dr < 10 and c1 + dc - 1 < 17:
+            try:
+                r2_smaller = r1 + dr
+                c2_smaller = c1 + dc - 1
+                # Double-check bounds
+                if 0 <= r2_smaller < 10 and 0 <= c2_smaller < 17:
+                    idx_smaller_c = extent_to_flat_idx(r1, c1, r2_smaller, c2_smaller)
+                    if idx_smaller_c < max_valid_count and idx_smaller_c in illegal_extents_set:
+                        hard_negatives.add(idx_smaller_c)
+            except (ValueError, IndexError):
+                pass  # Invalid extent, skip
+    
+    return hard_negatives
 
 
 def load_and_process_dataset(
@@ -337,6 +464,10 @@ def load_and_process_dataset(
                       f"Examples: {len(phase0_data)} Phase-0, {len(phase1_data)} Phase-1")
             
             # verify expert action is legal (should always be true)
+            # Also check that it's not (0,0) - single cell can never sum to 10
+            if phase1_action_compact == 0:
+                print(f"Warning: Expert extent is (0,0) for anchor ({r1},{c1}) - skipping (single cell can't sum to 10)")
+                continue
             if phase1_action_compact not in legal_extents_set:
                 # skip this example if expert action is not legal (shouldn't happen, but handle gracefully)
                 print(f"Warning: Expert extent {phase1_action_compact} not in legal set for anchor ({r1},{c1})")
@@ -347,12 +478,14 @@ def load_and_process_dataset(
             phase1_mask = torch.zeros(170, dtype=torch.bool)
             if include_negative_examples:
                 # include all geometrically valid extents (legal + illegal) so policy can learn
-                for idx in range(min(max_valid_count, 170)):
+                # Skip idx=0 (dr=0, dc=0) - single cell can never sum to 10
+                for idx in range(1, min(max_valid_count, 170)):
                     phase1_mask[idx] = True
             else:
                 # only include legal extents (old behavior)
+                # legal_extents_set already excludes idx=0 from compute_legal_extents
                 for legal_idx in sorted(legal_extents_set):
-                    if legal_idx < 170:  # Safety check
+                    if legal_idx < 170 and legal_idx > 0:  # Safety check: skip idx=0
                         phase1_mask[legal_idx] = True
             
             # store positive example with metadata for on-the-fly negative generation
@@ -451,12 +584,15 @@ def log_example_moves(
 def generate_negatives_for_positive(
     positive_example: Dict,
     negative_example_ratio: float,
-) -> List[Dict]:
+) -> Tuple[List[Dict], Dict]:
     """Generate negative examples for a positive example on-the-fly
     
-    Returns a list of negative examples to maintain the desired ratio.
+    Returns:
+        negatives: List of negative examples
+        stats: Dict with 'used_hard_negatives' (bool) and 'num_hard_negatives' (int)
     """
     negatives = []
+    stats = {'used_hard_negatives': False, 'num_hard_negatives': 0}
     grid = positive_example['grid']
     phase = positive_example['phase']
     
@@ -483,7 +619,7 @@ def generate_negatives_for_positive(
                         'phase': 0,
                     })
     else:
-        # Phase-1: generate negative extents
+        # Phase-1: generate negative extents using Pareto frontier hard negative mining
         r1 = positive_example['r1']
         c1 = positive_example['c1']
         legal_extents_set = positive_example['legal_extents_set']
@@ -493,12 +629,37 @@ def generate_negatives_for_positive(
             fractional = negative_example_ratio - base_count
             num_negative = base_count + (1 if random.random() < fractional else 0)
             if num_negative > 0:
-                sampled_illegal = random.sample(
-                    list(illegal_extents_set),
-                    min(num_negative, len(illegal_extents_set))
-                )
+                # Try to use hard negatives from Pareto frontier
+                max_valid_count = (10 - r1) * (17 - c1)
+                hard_negatives = set()
+                
+                if legal_extents_set:
+                    # Compute Pareto frontier
+                    frontier = get_pareto_frontier_extents(legal_extents_set, r1, c1)
+                    if frontier:
+                        # Get hard negatives near frontier
+                        hard_negatives = get_hard_negatives_near_frontier(
+                            frontier, r1, c1, max_valid_count, illegal_extents_set
+                        )
+                
+                # Use hard negatives if available, otherwise fallback to random
+                if hard_negatives and len(hard_negatives) > 0:
+                    stats['used_hard_negatives'] = True
+                    stats['num_hard_negatives'] = len(hard_negatives)
+                    sampled_illegal = random.sample(
+                        list(hard_negatives),
+                        min(num_negative, len(hard_negatives))
+                    )
+                else:
+                    # Fallback to random sampling
+                    sampled_illegal = random.sample(
+                        list(illegal_extents_set),
+                        min(num_negative, len(illegal_extents_set))
+                    )
+                
                 for illegal_extent_idx in sampled_illegal:
-                    if illegal_extent_idx < 170:  # safety check
+                    # Safety checks: exclude idx=0 and ensure within bounds
+                    if illegal_extent_idx < 170 and illegal_extent_idx > 0:
                         negatives.append({
                             'obs': positive_example['obs'].clone(),
                             'action': torch.tensor(illegal_extent_idx, dtype=torch.long),
@@ -509,7 +670,7 @@ def generate_negatives_for_positive(
                             'phase': 1,
                         })
     
-    return negatives
+    return negatives, stats
 
 
 def compute_sft_loss(
@@ -673,7 +834,7 @@ def compute_sft_loss(
         else:
             loss = standard_loss
     
-    accuracy = correct / total if total > 0 else 0.0
+        accuracy = correct / total if total > 0 else 0.0
     negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
     
     # compute average metrics
@@ -720,6 +881,9 @@ def train(config: Config):
             "legal_mass_bonus_zeta": config.legal_mass_bonus_zeta,
             "use_curriculum": config.use_curriculum,
             "curriculum_legal_only_epochs": config.curriculum_legal_only_epochs,
+            "extent_curriculum_epochs": config.extent_curriculum_epochs,
+            "min_extent_size": config.min_extent_size,
+            "max_extent_size_early": config.max_extent_size_early,
         },
         tags=["sft", "fruit-box", "supervised", "set-based-losses"],
     )
@@ -791,15 +955,83 @@ def train(config: Config):
             positive_per_batch = config.batch_size
             negative_per_batch = 0
         
+        # statistics tracking
+        hard_negative_count = 0
+        total_negative_count = 0
+        extent_sizes = []  # track max(dr, dc) for Phase-1 examples
+        
         for batch_idx, start in enumerate(tqdm(range(0, len(all_positive_data), positive_per_batch), desc="Training")):
             # sample positive examples for this batch
-            batch_positives = all_positive_data[start:start + positive_per_batch]
+            candidate_positives = all_positive_data[start:start + positive_per_batch]
+            
+            # apply extent-size curriculum filtering
+            batch_positives = []
+            if epoch < config.extent_curriculum_epochs:
+                # Filter Phase-1 examples by extent size
+                for pos_example in candidate_positives:
+                    if pos_example.get('phase') == 1:
+                        # Phase-1: check extent size
+                        r1 = pos_example['r1']
+                        c1 = pos_example['c1']
+                        action_idx = pos_example['action'].item()
+                        r2, c2 = flat_idx_to_extent(r1, c1, action_idx)
+                        dr = r2 - r1
+                        dc = c2 - c1
+                        max_size = max(dr, dc)
+                        
+                        # Include if within size bounds
+                        if config.min_extent_size <= max_size <= config.max_extent_size_early:
+                            batch_positives.append(pos_example)
+                            extent_sizes.append(max_size)
+                    else:
+                        # Phase-0: always include
+                        batch_positives.append(pos_example)
+                
+                # If filtering removed too many, pad with more candidates
+                next_idx = start + len(batch_positives)
+                max_search = min(len(all_positive_data), start + positive_per_batch * 3)  # safety limit
+                while len(batch_positives) < positive_per_batch and next_idx < max_search:
+                    if next_idx < len(all_positive_data):
+                        candidate = all_positive_data[next_idx]
+                        if candidate.get('phase') == 1:
+                            r1 = candidate['r1']
+                            c1 = candidate['c1']
+                            action_idx = candidate['action'].item()
+                            r2, c2 = flat_idx_to_extent(r1, c1, action_idx)
+                            dr = r2 - r1
+                            dc = c2 - c1
+                            max_size = max(dr, dc)
+                            if config.min_extent_size <= max_size <= config.max_extent_size_early:
+                                batch_positives.append(candidate)
+                                extent_sizes.append(max_size)
+                        else:
+                            batch_positives.append(candidate)
+                    next_idx += 1
+                    if len(batch_positives) >= positive_per_batch:
+                        break
+            else:
+                # No filtering: include all examples and track extent sizes
+                batch_positives = candidate_positives
+                for pos_example in batch_positives:
+                    if pos_example.get('phase') == 1:
+                        r1 = pos_example['r1']
+                        c1 = pos_example['c1']
+                        action_idx = pos_example['action'].item()
+                        r2, c2 = flat_idx_to_extent(r1, c1, action_idx)
+                        dr = r2 - r1
+                        dc = c2 - c1
+                        max_size = max(dr, dc)
+                        extent_sizes.append(max_size)
             
             # generate negative examples on-the-fly for each positive
             batch_negatives = []
             if config.include_negative_examples:
                 for pos_example in batch_positives:
-                    negs = generate_negatives_for_positive(pos_example, config.negative_example_ratio)
+                    negs, neg_stats = generate_negatives_for_positive(pos_example, config.negative_example_ratio)
+                    # track hard negative statistics
+                    if neg_stats['used_hard_negatives']:
+                        hard_negative_count += 1
+                    total_negative_count += 1
                     # limit negatives per positive to maintain batch size
                     if len(batch_negatives) + len(negs) <= negative_per_batch:
                         batch_negatives.extend(negs)
@@ -832,17 +1064,17 @@ def train(config: Config):
                     mask = torch.zeros(170, dtype=torch.bool)
                     legal_set = legal_actions_sets[i]
                     for legal_idx in legal_set:
-                        if legal_idx < 170:
+                        if legal_idx < 170 and legal_idx > 0:  # Skip idx=0 (dr=0, dc=0)
                             mask[legal_idx] = True
                     updated_masks.append(mask)
                 batch_masks = torch.stack(updated_masks).to(device)
             else:
                 # full phase: use all-geometric masks (already in batch_data)
                 batch_masks = torch.stack([
-                    d['mask'] if d['mask'].shape[0] == 170 
-                    else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
-                    for d in batch_data
-                ]).to(device)
+                d['mask'] if d['mask'].shape[0] == 170 
+                else torch.cat([d['mask'], torch.zeros(170 - d['mask'].shape[0], dtype=torch.bool)])
+                for d in batch_data
+            ]).to(device)
             
             # stack batches
             batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
@@ -891,10 +1123,20 @@ def train(config: Config):
         avg_topk_illegal = np.mean([d.get('topk_illegal', 0.0) for d in epoch_losses])
         avg_legal_mass = np.mean([d.get('legal_mass', 0.0) for d in epoch_losses])
         
+        # hard negative mining statistics
+        hard_negative_ratio = hard_negative_count / max(total_negative_count, 1)
+        
+        # extent size distribution
+        avg_extent_size = np.mean(extent_sizes) if extent_sizes else 0.0
+        max_extent_size = max(extent_sizes) if extent_sizes else 0
+        
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
             print(f"  Negative accuracy (avoiding illegal actions): {avg_negative_accuracy:.4f}")
+            print(f"  Hard negative mining: {hard_negative_count}/{total_negative_count} ({hard_negative_ratio:.2%})")
+        if extent_sizes:
+            print(f"  Extent size: avg={avg_extent_size:.2f}, max={max_extent_size}")
         if not use_legal_only_masks:
             print(f"  Set-based losses: Illegal mass={avg_illegal_mass:.4f}, Top-K illegal={avg_topk_illegal:.4f}, Legal mass={avg_legal_mass:.4f}")
         
@@ -921,6 +1163,13 @@ def train(config: Config):
             log_dict["train/negative_accuracy"] = avg_negative_accuracy
             log_dict["train/positive_count"] = total_positive
             log_dict["train/negative_count"] = total_negative
+            log_dict["train/hard_negative_ratio"] = hard_negative_ratio
+        if extent_sizes:
+            log_dict["train/avg_extent_size"] = avg_extent_size
+            log_dict["train/max_extent_size"] = max_extent_size
+            # log histogram of extent sizes
+            if len(extent_sizes) > 0:
+                log_dict["train/extent_size_hist"] = wandb.Histogram(extent_sizes)
         if not use_legal_only_masks:
             log_dict["train/illegal_mass"] = avg_illegal_mass
             log_dict["train/topk_illegal"] = avg_topk_illegal
