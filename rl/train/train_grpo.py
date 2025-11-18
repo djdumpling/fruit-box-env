@@ -47,29 +47,29 @@ class Config:
     epochs: int = 4
     
     # phase-0 (PPO) hyperparameters
-    phase0_lr: float = 3e-5  # higher for strategy learning
-    phase0_clip_eps: float = 0.08  # was 0.12, tighter to avoid breaking the good policy
-    phase0_target_kl: float = 0.005  # was 0.008, keep updates small
+    phase0_lr: float = 1e-5  # lower (policy is good)
+    phase0_clip_eps: float = 0.06  # was 0.12, tighter to avoid breaking the good policy
+    phase0_target_kl: float = 0.003  # was 0.008, keep updates small
     phase0_value_coef: float = 0.8
     
     # phase-1 (GRPO) hyperparameters
-    phase1_lr: float = 5e-5  # higher for strategy learning
-    phase1_clip_eps: float = 0.15  # was 0.2
-    phase1_target_ratio: float = 2.0  # was 2.5
-    grpo_k: int = 16  # was 24, don't need as much exploration
+    phase1_lr: float = 2e-5  # lower (policy is good)
+    phase1_clip_eps: float = 0.12  # was 0.2
+    phase1_target_ratio: float = 1.8  # was 2.5
+    grpo_k: int = 24 # higher chance of finding minimal rewards
     frozen_refresh_interval: int = 100
-    grpo_temperature: float = 1.5  # was 1.8, policy is already good
+    grpo_temperature: float = 1.8 # (more diverse sampling)
     min_reward_std: float = 0.01
     
     # shared hyperparameters
     max_updates: int = 2500  # more updates for strategy learning
-    gamma: float = 0.995  # standard discount, no augment factor
+    gamma: float = 0.998  # standard discount, no augment factor
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.05  # start higher for exploration
-    entropy_target: float = 0.5  # start higher
+    entropy_coef: float = 0.03  # start higher for exploration
+    entropy_target: float = 0.3  # start higher
     entropy_penalty_coef: float = 0.2  # stronger penalty
     grad_clip: float = 1.0
-    lr_warmup_steps: int = 50  # was 100, policy is already good so less warmup needed
+    lr_warmup_steps: int = 30  # was 50, policy is already good so less warmup needed
     
     # exploration schedule
     exploration_schedule: str = "linear"  # linear decay of entropy over time
