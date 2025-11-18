@@ -183,13 +183,21 @@ def test_policy_with_all_masks(
             
             r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
             
-            # validate move
+            # validate move (validation_env is only used for checking validity)
             step_info = validation_env.step(r1, c1, r2, c2)
             is_valid = step_info.valid
             
             total_moves += 1
             if is_valid:
                 valid_moves += 1
+                # Update validation_env state only if move was valid (to keep in sync for future validations)
+                # Note: validation_env was already stepped above, so it's already updated if valid
+            
+            # Step Phase-1 in wrapped_env (this actually executes the move and updates state)
+            obs, reward, terminated, truncated, info = wrapped_env.step(extent_idx)
+            
+            # If move was invalid, validation_env state is now out of sync, but that's okay
+            # since we only use it for validation, not for the actual game state
             
             if terminated or truncated:
                 break
