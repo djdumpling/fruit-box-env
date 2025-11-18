@@ -1,11 +1,11 @@
-""" python rl/train_sft.py --seed 42 --epochs 200 --batch_size 128 --lr 2e-4 """
+""" python rl//train/train_sft.py --seed 42 --epochs 200 --batch_size 128 --lr 2e-4 """
 # use set-based legality losses
 # penalize all illegal actions simulatenously using set-based losses computed from the same forward pass
 
 import sys
 from pathlib import Path
-# add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# add project root to path for imports (go up 2 levels from rl/train/train_sft.py)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import argparse
 import os

@@ -1,9 +1,9 @@
-""" python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch30.pt """
+""" python rl/train/train_grpo.py --seed 42 --load-checkpoint artifacts/policy_sft_epoch80.pt """
 
 import sys
 from pathlib import Path
-# add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# add project root to path for imports (go up 2 levels from rl/train/train_grpo.py)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import argparse
 import random

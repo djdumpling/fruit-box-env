@@ -10,7 +10,8 @@ Usage:
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# add project root to path for imports (go up 2 levels from rl/train/train_q_learning.py)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import argparse
 import random

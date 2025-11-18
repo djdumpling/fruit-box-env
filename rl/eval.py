@@ -1,4 +1,9 @@
 """Evaluation script for trained GRPO policy."""
+import sys
+from pathlib import Path
+# add project root to path for imports (go up 1 level from rl/eval.py)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import argparse
 import numpy as np
 import torch
