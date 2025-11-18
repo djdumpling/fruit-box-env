@@ -144,7 +144,7 @@ def compute_grpo_loss(
     
     return loss, info
 
-
+# add weighting to learn minimal policy better
 def simulate_action_reward(
     env: Sum10Env,
     anchor_idx: int,
@@ -152,20 +152,12 @@ def simulate_action_reward(
     wrapper,
     illegal_penalty: float = -0.05,
     legal_action_bonus: float = 0.0,
+    area_penalty_coef: float = 0.5,
+    turn_number: int = 0,
+    early_turn_threshold: int = 30,
+    early_penalty_weight: float = 1.0
 ) -> float:
-    """Simulate action and return immediate reward.
-    
-    Args:
-        env: Sum10Env instance (will be cloned)
-        anchor_idx: Flat index for anchor (r1, c1)
-        extent_idx: Flat index for extent (r2, c2) given anchor
-        wrapper: TwoPhaseWrapper instance (for conversion functions)
-        illegal_penalty: Penalty for illegal moves (default: -0.05)
-        legal_action_bonus: Bonus for legal moves (default: 0.0)
-    
-    Returns:
-        reward: Immediate reward from the action (penalty applied if illegal, bonus if legal)
-    """
+    """Simulate action and return immediate reward."""
     # clone environment state
     cloned_env = Sum10Env()
     cloned_env.grid = env.grid.copy()
@@ -179,7 +171,23 @@ def simulate_action_reward(
     step_info = cloned_env.step(r1, c1, r2, c2)
     
     if step_info.valid:
-        return float(step_info.reward) + legal_action_bonus
+        base = float(step_info.reward) + legal_action_bonus
+
+        # time-weighted penalty application
+
+        if area_penalty_coef > 0 and base > 2:
+            if turn_number < early_turn_threshold:
+                # max penalty is early_penalty_weight
+                # linearly annealed down to 0 by early_turn_threshold
+                time_weight = early_penalty_weight * (1.0 - turn_number / early_turn_threshold)
+            else:
+                time_weight = 0.0
+
+            reward_penalty = area_penalty_coef * base * time_weight
+            return base - reward_penalty
+
+        return base
+
     else:
         # apply penalty for illegal moves (consistent with actual execution)
         return illegal_penalty

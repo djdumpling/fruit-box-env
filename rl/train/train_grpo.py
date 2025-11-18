@@ -87,6 +87,11 @@ class Config:
     minimal_area_dataset: str = "djdumpling/fruit-box-minimal-area"
     minimal_area_num_grids: int = 100  # number of grids to load
     
+    # minimal-area strategy hyperparameters
+    area_penalty_coef: float = 0.3  # penalty coefficient for rewards > 2 in early turns
+    early_turn_threshold: int = 30  # turns where area penalty applies
+    early_penalty_weight: float = 1.0  # multiplier for early-turn penalty
+    
     # other
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
@@ -523,6 +528,10 @@ def collect_rollouts(
                         candidates_original_indices[k].item(),
                         env,
                         illegal_penalty=config.illegal_penalty,
+                        area_penalty_coef=config.area_penalty_coef,
+                        turn_number=env.game_env.turn,
+                        early_turn_threshold=config.early_turn_threshold,
+                        early_penalty_weight=config.early_penalty_weight,
                     )
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
@@ -713,9 +722,12 @@ def train(config: Config, use_wandb: bool = True):
                 "batch_size": config.batch_size,
                 "lr_warmup_steps": config.lr_warmup_steps,
                 "min_reward_std": config.min_reward_std,
+                "area_penalty_coef": config.area_penalty_coef,
+                "early_turn_threshold": config.early_turn_threshold,
+                "early_penalty_weight": config.early_penalty_weight,
                 "seed": config.seed,
             },
-            tags=["grpo", "fruit-box", "two-phase"],
+            tags=["grpo", "fruit-box", "two-phase", "minimal-area"],
         )
         print("Wandb initialized!")
     
