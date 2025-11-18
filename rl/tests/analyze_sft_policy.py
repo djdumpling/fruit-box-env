@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import argparse
 import numpy as np
 import torch
+import wandb
 from datasets import load_dataset
 from typing import List, Tuple, Optional
 from collections import Counter
@@ -17,15 +18,7 @@ from rl.train_sft import build_observation, flat_idx_to_anchor, flat_idx_to_exte
 
 
 def load_checkpoint_from_wandb(artifact_path: str) -> str:
-    """Download checkpoint from wandb artifact and return local path.
-    
-    Args:
-        artifact_path: Wandb artifact path (e.g., 'djdumpling-yale/fruit-box-sft/sft-checkpoint-epoch-40:v5')
-    
-    Returns:
-        Local path to the checkpoint file
-    """
-    import wandb
+    """Download checkpoint from wandb artifact and return local path."""
     
     print(f"Downloading wandb artifact: {artifact_path}")
     # Initialize wandb run to access artifacts
