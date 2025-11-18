@@ -1,13 +1,4 @@
-"""
-
-python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch30.pt
-
-python rl/eval.py \
-  --checkpoint checkpoints/policy_final.pt \
-  --num_episodes 100 \
-  --dataset djdumpling/fruit-box-minimal-area \
-  --dataset_split train
-"""
+""" python rl/train_grpo.py --seed 42 --load-checkpoint checkpoints/policy_sft_epoch30.pt """
 
 import sys
 from pathlib import Path
@@ -31,6 +22,36 @@ from rl.models.policy import CNNPolicy
 from rl.algo.ppo import compute_gae, compute_ppo_loss, map_action_to_valid_space
 from rl.algo.grpo import compute_grpo_loss, simulate_action_reward
 from fruit_box import Sum10Env
+
+
+def is_wandb_artifact(path: str) -> bool:
+    return "/" in path and ":" in path and not Path(path).exists()
+
+
+def load_checkpoint_from_wandb(artifact_path: str) -> str:
+    print(f"Downloading wandb artifact: {artifact_path}")
+    # Initialize wandb run to access artifacts
+    # Note: This creates a temporary run just for artifact access
+    run = wandb.init()
+    try:
+        artifact = run.use_artifact(artifact_path, type='model')
+        artifact_dir = artifact.download()
+        
+        # Find the checkpoint file in the artifact directory
+        artifact_path_obj = Path(artifact_dir)
+        checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+        
+        if not checkpoint_files:
+            raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+        
+        if len(checkpoint_files) > 1:
+            print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+        
+        checkpoint_path = str(checkpoint_files[0])
+        print(f"Downloaded checkpoint to: {checkpoint_path}")
+        return checkpoint_path
+    finally:
+        wandb.finish()
 
 
 @dataclass
@@ -762,8 +783,13 @@ def train(config: Config, use_wandb: bool = True):
     
     # load checkpoint if provided
     if config.load_checkpoint:
-        print(f"Loading checkpoint from {config.load_checkpoint}...")
-        checkpoint = torch.load(config.load_checkpoint, map_location=device)
+        # Check if checkpoint is a wandb artifact
+        checkpoint_path = config.load_checkpoint
+        if is_wandb_artifact(checkpoint_path):
+            checkpoint_path = load_checkpoint_from_wandb(checkpoint_path)
+        
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         
         # load checkpoint (includes both policy and value heads)
         policy.load_state_dict(checkpoint)
@@ -1235,7 +1261,8 @@ def main():
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to checkpoint file to load at start")
+    parser.add_argument("--load-checkpoint", type=str, default=None, 
+                       help="Path to checkpoint file or wandb artifact (e.g., 'checkpoints/policy.pt' or 'entity/project/artifact-name:v0')")
     parser.add_argument("--use-legal-only-masks", action="store_true",
                        help="Use legal-only masks (required when loading SFT checkpoints)")
     parser.add_argument("--no-legal-only-masks", action="store_true",

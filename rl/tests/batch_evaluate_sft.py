@@ -1,7 +1,8 @@
 """Batch evaluation of SFT policy on multiple random grids"""
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path (go up 2 levels from rl/tests/batch_evaluate_sft.py)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import argparse
 import json

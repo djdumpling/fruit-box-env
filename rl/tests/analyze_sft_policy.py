@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path (go up 2 levels from rl/tests/analyze_sft_policy.py)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import argparse
 import numpy as np
