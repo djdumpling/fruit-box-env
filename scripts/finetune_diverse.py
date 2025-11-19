@@ -200,8 +200,13 @@ def train(
     else:
         print(f"Warning: Checkpoint {checkpoint_path} not found, training from scratch")
     
-    # Optimizer
+    # Optimizer - use lower learning rate for stability with diverse dataset
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr, weight_decay=1e-5)
+    
+    # Use a learning rate scheduler to reduce LR if loss becomes unstable
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+    )
     
     # Combine data
     all_data = phase0_data + phase1_data
@@ -251,26 +256,51 @@ def train(
                 continue
             
             # Forward pass
+            # Use more conservative loss weights for diverse dataset with many negatives
             loss, info = compute_sft_loss(
                 policy,
                 batch_obs,
                 batch_actions,
                 batch_masks,
                 batch_is_positive,
-                negative_loss_weight=2.0,
+                negative_loss_weight=1.0,  # Reduced from 2.0
                 legal_actions_sets=legal_actions_sets,
-                illegal_mass_alpha=2.0,
-                illegal_mass_beta=3.0,
+                illegal_mass_alpha=1.0,  # Reduced from 2.0
+                illegal_mass_beta=1.5,  # Reduced from 3.0
                 topk_illegal_k=10,
-                topk_illegal_delta=5.0,
-                legal_mass_bonus_zeta=0.5,
+                topk_illegal_delta=2.5,  # Reduced from 5.0
+                legal_mass_bonus_zeta=0.25,  # Reduced from 0.5
                 use_set_based_losses=True,
             )
+            
+            # Check for NaN/inf in loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss detected, skipping batch. Loss: {loss.item()}")
+                print(f"  Info: {info}")
+                continue
+            
+            # Clamp loss to prevent extreme values (more conservative)
+            loss = torch.clamp(loss, min=-50.0, max=50.0)
             
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            
+            # Check for NaN gradients
+            has_nan_grad = False
+            for param in policy.parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        has_nan_grad = True
+                        break
+            
+            if has_nan_grad:
+                print(f"Warning: NaN/Inf gradients detected, skipping batch")
+                optimizer.zero_grad()
+                continue
+            
+            # More aggressive gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
             optimizer.step()
             
             epoch_losses.append(info['loss'])
@@ -284,8 +314,16 @@ def train(
             epoch_legal_predictions.append(info.get('legal_predictions', 0))
             epoch_total_predictions.append(info.get('total_predictions', 0))
         
-        # Compute epoch metrics
-        avg_loss = np.mean(epoch_losses)
+        # Compute epoch metrics (filter out NaN values)
+        valid_losses = [l for l in epoch_losses if not (np.isnan(l) or np.isinf(l))]
+        if not valid_losses:
+            print(f"  Warning: All losses are NaN/Inf in epoch {epoch + 1}")
+            avg_loss = float('nan')
+        else:
+            avg_loss = np.mean(valid_losses)
+            # Update learning rate scheduler
+            scheduler.step(avg_loss)
+        
         avg_accuracy = np.mean(epoch_accuracies)
         avg_negative_accuracy = np.mean(epoch_negative_accuracies) if epoch_negative_accuracies else 0.0
         total_positive = sum(epoch_positive_counts)
