@@ -13,7 +13,6 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
-import gymnasium as gym
 import wandb
 
 from rl.envs.sum10_env import Sum10GymEnv
@@ -21,7 +20,6 @@ from rl.envs.split_wrapper import TwoPhaseWrapper
 from rl.models.policy import CNNPolicy
 from rl.algo.ppo import compute_gae, compute_ppo_loss, map_action_to_valid_space
 from rl.algo.grpo import compute_grpo_loss, simulate_action_reward
-from fruit_box import Sum10Env
 
 
 def is_wandb_artifact(path: str) -> bool:
