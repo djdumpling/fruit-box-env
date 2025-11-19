@@ -716,18 +716,52 @@ def collect_rollouts(
         dones = torch.tensor(dones_list, device=obs.device, dtype=torch.bool)
         
         # update rewards and validity for Phase-1 completions
-        # phase-1 rewards and validity go to the corresponding Phase-0 transition
+        # CRITICAL: Phase-1 completions happen when we step envs that were in Phase-1 at the START of this step
+        # These envs had Phase-0 transitions added in the PREVIOUS step
+        # So we need to match Phase-1 completions (from envs that were Phase-1) to Phase-0 transitions
+        # The key insight: envs that are Phase-1 NOW were Phase-0 in the PREVIOUS step
+        # But wait - actually, Phase-0 and Phase-1 transitions are added in the SAME step for different envs
+        # Then we step all envs. So:
+        # - Env A: Phase-0 → add Phase-0 transition → step → becomes Phase-1
+        # - Env B: Phase-1 → add Phase-1 transition → step → becomes Phase-0 or resets
+        # So Phase-0 transitions added this step will be completed next step when those envs become Phase-1
+        # But Phase-1 transitions added this step complete immediately when we step
+        # So we need to match Phase-1 completions (from stepping Phase-1 envs) to Phase-0 transitions from PREVIOUS step
+        # Actually wait - let me reconsider. The phases at the START of the step determine what we do:
+        # - If Phase-0: we add Phase-0 transition, then step → becomes Phase-1
+        # - If Phase-1: we add Phase-1 transition, then step → completes the move, becomes Phase-0
+        # So Phase-1 transitions added this step complete when we step (same step)
+        # But Phase-0 transitions added this step will complete next step
+        # So we need to match Phase-1 completions to Phase-0 transitions from PREVIOUS step
+        # But we're updating in the same step, so we need to match to Phase-0 transitions that were added
+        # when these envs were Phase-0, which was the PREVIOUS step
+        
+        # Actually, the simplest approach: match Phase-1 completions (from stepping Phase-1 envs) 
+        # to the most recent Phase-0 transition for each env
         if phase1_mask.any():
             phase1_indices = torch.where(phase1_mask)[0]
-            for i, env_idx in enumerate(phase1_indices):
-                # find the most recent Phase-0 transition for this env
+            for i, env_idx_tensor in enumerate(phase1_indices):
+                env_idx = env_idx_tensor.item()
+                # Find the most recent Phase-0 transition for this env
+                # This should be from the previous step when this env was Phase-0
+                found = False
                 for j in range(len(buffer.phase0_env_indices) - 1, -1, -1):
-                    if buffer.phase0_env_indices[j] == env_idx.item():
-                        # assign Phase-1 reward and validity to this Phase-0 transition
-                        buffer.phase0_rewards[j] = torch.tensor([rewards[env_idx].item()], device='cpu')
-                        buffer.phase0_dones[j] = torch.tensor([dones[env_idx].item()], device='cpu', dtype=torch.bool)
-                        buffer.phase0_valid[j] = torch.tensor([valid_list[env_idx]], device='cpu', dtype=torch.bool)
+                    if buffer.phase0_env_indices[j] == env_idx:
+                        # This Phase-0 transition corresponds to this Phase-1 completion
+                        # CRITICAL: valid_list is indexed by env_idx (0 to num_envs-1)
+                        if env_idx < len(valid_list):
+                            is_valid = valid_list[env_idx]
+                            buffer.phase0_rewards[j] = torch.tensor([rewards[env_idx].item()], device='cpu')
+                            buffer.phase0_dones[j] = torch.tensor([dones[env_idx].item()], device='cpu', dtype=torch.bool)
+                            buffer.phase0_valid[j] = torch.tensor([is_valid], device='cpu', dtype=torch.bool)
+                            found = True
+                        else:
+                            print(f"WARNING: env_idx {env_idx} >= len(valid_list) {len(valid_list)}")
+                            buffer.phase0_valid[j] = torch.tensor([False], device='cpu', dtype=torch.bool)
                         break
+                if not found and step > 0:  # Allow first step to not have matches
+                    # This can happen if env resets or if Phase-0 transition wasn't added
+                    pass  # Phase-0 transition stays with initial values (reward=0, valid=False)
         
         # reset done environments
         for env_idx, done in enumerate(dones):
@@ -1329,12 +1363,31 @@ def train(config: Config, use_wandb: bool = True):
             valid_moves = phase0_data["valid"].sum().item()  # use actual validity instead of rewards > 0
             total_moves = phase0_data["valid"].numel()
             
+            # Debug: check if rewards > 0 matches validity
+            rewards_positive = (phase0_data["rewards"] > 0).sum().item()
+            validity_rate = valid_moves / max(total_moves, 1)
+            reward_positive_rate = rewards_positive / max(total_moves, 1)
+            
+            # Debug: check how many Phase-0 transitions never got updated
+            # (should be 0 if all Phase-0 transitions have corresponding Phase-1 completions)
+            never_updated = (phase0_data["rewards"] == 0.0).sum().item()
+            
             wandb.log({
                 "rollout/total_reward": total_rewards,
                 "rollout/mean_reward": mean_reward,
                 "rollout/total_moves": total_moves,
-                "rollout/legality_rate": valid_moves / max(total_moves, 1),
+                "rollout/legality_rate": validity_rate,
+                "debug/rollout_rewards_positive": rewards_positive,
+                "debug/rollout_reward_positive_rate": reward_positive_rate,
+                "debug/rollout_never_updated_count": never_updated,
             }, step=update)
+            
+            # Print warning if legality rate is suspiciously low
+            if validity_rate < 0.5 and update % 10 == 0:
+                print(f"WARNING: Low legality rate {validity_rate:.2%} at update {update}")
+                print(f"  Valid moves: {valid_moves}/{total_moves}")
+                print(f"  Rewards > 0: {rewards_positive}/{total_moves}")
+                print(f"  Never updated: {never_updated}/{total_moves}")
         
         # Set policy back to eval mode for next rollout collection
         policy.eval()
