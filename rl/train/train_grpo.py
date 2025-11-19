@@ -118,7 +118,7 @@ class Config:
     render_interval: int = 5
     render_env_idx: int = 0
     load_checkpoint: Optional[str] = None  # path to checkpoint to load at start
-    use_legal_only_masks: bool = False  # use legal-only masks (only needed for old SFT checkpoints that didn't learn legality)
+    use_legal_only_masks: bool = False  # use legal-only masks (only needed for epoch 0 SFT checkpoints; epoch 1+ learned legality with all geometric masks)
 
 
 class RolloutBuffer:
@@ -334,7 +334,7 @@ def load_minimal_area_grids(dataset_name: str, num_grids: int) -> List[np.ndarra
     return grids
 
 
-def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400, initial_grids: Optional[List[np.ndarray]] = None, grid_index: int = 0):
+def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_updates: int = 400, initial_grids: Optional[List[np.ndarray]] = None, grid_index: int = 0, curriculum_legal_only: bool = False):
     """Create environment"""
     # if initial_grids provided, use the grid at grid_index (cycling through)
     if initial_grids is not None and len(initial_grids) > 0:
@@ -344,7 +344,7 @@ def make_env(seed: int, initial_grid: Optional[np.ndarray] = None, curriculum_up
         env = Sum10GymEnv(initial_grid=initial_grid, seed=seed)
     else:
         env = Sum10GymEnv(seed=seed)
-    env = TwoPhaseWrapper(env, curriculum_legal_only=True, curriculum_updates=curriculum_updates)
+    env = TwoPhaseWrapper(env, curriculum_legal_only=curriculum_legal_only, curriculum_updates=curriculum_updates)
     return env
 
 
@@ -812,9 +812,16 @@ def train(config: Config, use_wandb: bool = True):
     # create environments (create first, reset later to avoid segfault)
     envs = []
     for i in range(config.num_envs):
-        env = make_env(config.seed + i, curriculum_updates=config.curriculum_updates, initial_grids=initial_grids, grid_index=i)
+        env = make_env(
+            config.seed + i, 
+            curriculum_updates=config.curriculum_updates, 
+            initial_grids=initial_grids, 
+            grid_index=i,
+            curriculum_legal_only=config.use_legal_only_masks
+        )
         envs.append(env)
     print(f"All {len(envs)} environments created")
+    print(f"Using legal-only masks: {config.use_legal_only_masks}")
     
     # create policy
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
@@ -1310,7 +1317,7 @@ def main():
     parser.add_argument("--load-checkpoint", type=str, default=None, 
                        help="Path to checkpoint file or wandb artifact (e.g., 'checkpoints/policy.pt' or 'entity/project/artifact-name:v0')")
     parser.add_argument("--use-legal-only-masks", action="store_true",
-                       help="Use legal-only masks (required when loading SFT checkpoints)")
+                       help="Use legal-only masks (only needed for epoch 0 SFT checkpoints; epoch 1+ learned legality)")
     parser.add_argument("--no-legal-only-masks", action="store_true",
                        help="Disable legal-only masks even when loading checkpoints")
     args = parser.parse_args()
@@ -1318,10 +1325,12 @@ def main():
     # use legal-only masks only if explicitly requested
     use_legal_only = args.use_legal_only_masks
     if args.load_checkpoint and not use_legal_only and not args.no_legal_only_masks:
-        # Warn user that SFT checkpoints may need legal-only masks, but don't auto-enable
-        print(f"WARNING: Loading SFT checkpoint without --use-legal-only-masks. "
-              f"SFT checkpoints were trained with legal-only masks. "
-              f"If you see legality issues, try adding --use-legal-only-masks flag.")
+        # Note: SFT checkpoints from epoch 1+ were trained with all geometric masks (including illegal actions)
+        # and learned to avoid illegal actions via set-based losses. They should work fine without legal-only masks.
+        # Only epoch 0 SFT checkpoints used legal-only masks (curriculum phase).
+        print(f"INFO: Loading SFT checkpoint without --use-legal-only-masks. "
+              f"SFT checkpoints from epoch 1+ were trained with all geometric masks and learned legality. "
+              f"This should work fine. If you see legality issues, the checkpoint might be from epoch 0.")
     
     config = Config(seed=args.seed, load_checkpoint=args.load_checkpoint, use_legal_only_masks=use_legal_only)
     train(config, use_wandb=not args.no_wandb)
