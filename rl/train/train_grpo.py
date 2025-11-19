@@ -78,7 +78,7 @@ class Config:
     phase1_clip_eps: float = 0.12  # was 0.2
     phase1_target_ratio: float = 1.8  # was 2.5
     grpo_k: int = 24 # higher chance of finding minimal rewards
-    frozen_refresh_interval: int = 100
+    frozen_refresh_interval: int = 30  # reduced from 100 to prevent frozen policy from becoming too outdated
     grpo_temperature: float = 1.8 # (more diverse sampling)
     min_reward_std: float = 0.01
     
@@ -140,6 +140,7 @@ class RolloutBuffer:
         self.phase0_dones = []
         self.phase0_masks = []
         self.phase0_env_indices = []  # track which env each transition belongs to
+        self.phase0_valid = []  # track validity of moves (True if legal, False if illegal)
         
         # phase-1 data (extent selection)
         self.phase1_obs = []
@@ -170,9 +171,10 @@ class RolloutBuffer:
         self.phase0_values.append(value.detach().cpu())
         self.phase0_masks.append(mask.detach().cpu())
         self.phase0_env_indices.append(env_idx)
-        # initialize reward and done (will be updated when Phase-1 completes)
+        # initialize reward, done, and valid (will be updated when Phase-1 completes)
         self.phase0_rewards.append(torch.tensor([0.0], device='cpu'))
         self.phase0_dones.append(torch.tensor([False], device='cpu', dtype=torch.bool))
+        self.phase0_valid.append(torch.tensor([False], device='cpu', dtype=torch.bool))
     
     def add_phase1(
         self,
@@ -211,6 +213,7 @@ class RolloutBuffer:
             "rewards": torch.stack(self.phase0_rewards, dim=0).to(self.device),
             "dones": torch.stack(self.phase0_dones, dim=0).to(self.device),
             "masks": torch.stack(self.phase0_masks, dim=0).to(self.device),
+            "valid": torch.stack(self.phase0_valid, dim=0).to(self.device),
         }
     
     def get_phase1_data(self) -> Dict:
@@ -252,6 +255,7 @@ class RolloutBuffer:
         self.phase0_dones.clear()
         self.phase0_masks.clear()
         self.phase0_env_indices.clear()
+        self.phase0_valid.clear()
         
         self.phase1_obs.clear()
         self.phase1_anchors.clear()
@@ -540,6 +544,10 @@ def collect_rollouts(
                 candidates_original_indices = valid_indices[candidates]
                 
                 # simulate each candidate to get rewards
+                # Clear debug info before collecting rewards for this batch
+                if hasattr(simulate_action_reward, '_debug_info'):
+                    simulate_action_reward._debug_info.clear()
+                
                 candidates_rewards = []
                 for k in range(config.grpo_k):
                     # use the original index from the valid_mask
@@ -557,26 +565,50 @@ def collect_rollouts(
                     candidates_rewards.append(reward)
                 candidates_rewards = torch.tensor(candidates_rewards, device=obs.device)
                 
+                # Collect and log debug info for delayed gratification penalty
+                if hasattr(simulate_action_reward, '_debug_info') and len(simulate_action_reward._debug_info) > 0:
+                    debug_info = simulate_action_reward._debug_info
+                    if current_update is not None and current_update % 50 == 0:
+                        # Aggregate debug stats
+                        base_rewards = [d['base_reward'] for d in debug_info]
+                        turn_numbers = [d['turn_number'] for d in debug_info]
+                        time_weights = [d['time_weight'] for d in debug_info]
+                        reward_penalties = [d['reward_penalty'] for d in debug_info]
+                        final_rewards = [d['final_reward'] for d in debug_info]
+                        penalties_applied = sum(1 for d in debug_info if d['penalty_applied'])
+                        
+                        step_info_rewards = [d['step_info_reward'] for d in debug_info]
+                        
+                        wandb.log({
+                            "debug/reward_calc_step_info_reward_mean": np.mean(step_info_rewards) if step_info_rewards else 0,
+                            "debug/reward_penalty_base_reward_mean": np.mean(base_rewards) if base_rewards else 0,
+                            "debug/reward_penalty_turn_number_mean": np.mean(turn_numbers) if turn_numbers else 0,
+                            "debug/reward_penalty_time_weight_mean": np.mean(time_weights) if time_weights else 0,
+                            "debug/reward_penalty_penalty_mean": np.mean(reward_penalties) if reward_penalties else 0,
+                            "debug/reward_penalty_final_reward_mean": np.mean(final_rewards) if final_rewards else 0,
+                            "debug/reward_penalty_applied_ratio": penalties_applied / len(debug_info) if debug_info else 0,
+                            "debug/reward_calc_final_reward_std": np.std(final_rewards) if final_rewards else 0,
+                        }, commit=False)
+                
                 # check reward diversity - critical for GRPO
                 reward_std = candidates_rewards.std().item()
-                reward_range = candidates_rewards.max().item() - candidates_rewards.min().item()
                 
                 # enhanced debug logging for candidate rewards (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
-                    # compute relative advantages for diversity metric
-                    mean_reward = candidates_rewards.mean().item()
-                    rel_advantages = candidates_rewards - mean_reward
-                    rel_adv_std = rel_advantages.std().item()
-                    
                     wandb.log({
                         "debug/phase1_candidate_rewards_mean": candidates_rewards.mean().item(),
                         "debug/phase1_candidate_rewards_std": reward_std,
-                        "debug/phase1_candidate_rewards_range": reward_range,
-                        "debug/phase1_reward_diversity": rel_adv_std,
                         "debug/phase1_candidate_rewards_min": candidates_rewards.min().item(),
                         "debug/phase1_candidate_rewards_max": candidates_rewards.max().item(),
                         "debug/phase1_num_legal_candidates": (candidates_rewards >= 0).sum().item(),  # legal = non-negative (includes reward == 0)
-                        "debug/phase1_num_penalized_candidates": (candidates_rewards < 0).sum().item(),  # penalized = negative (all negative rewards)
+                    }, commit=False)
+                
+                # Debug logging: check if all candidates are the same action
+                if current_update is not None and current_update % 50 == 0:
+                    unique_actions = torch.unique(candidates_original_indices)
+                    unique_action_count = len(unique_actions)
+                    wandb.log({
+                        "debug/phase1_unique_candidate_actions": unique_action_count,
                     }, commit=False)
                 
                 # store candidates with original indices for consistency
@@ -619,6 +651,7 @@ def collect_rollouts(
         new_obs_list = []
         rewards_list = []
         dones_list = []
+        valid_list = []  # track validity of moves
         phase0_reward_indices = []
         
         phase0_action_map = {}
@@ -641,6 +674,7 @@ def collect_rollouts(
                 new_obs_list.append(obs_new)
                 rewards_list.append(0.0)  # no reward in Phase-0
                 dones_list.append(False)
+                valid_list.append(True)  # Phase-0 is always valid (just selecting anchor)
                 phase0_reward_indices.append(env_idx)
             elif env_idx in phase1_action_map:
                 # phase-1: step with executed extent action
@@ -654,6 +688,10 @@ def collect_rollouts(
                     turn_before = env.game_env.turn
                 
                 obs_new, reward, terminated, truncated, info = env.step(action_idx)
+                
+                # track validity from environment info
+                is_valid = info.get("valid", True)
+                valid_list.append(is_valid)
                 
                 # store visualization data after step (only for valid moves with reward > 0)
                 if visualize and env_idx == render_env_idx and reward > 0:
@@ -673,22 +711,24 @@ def collect_rollouts(
                 new_obs_list.append(obs_new)
                 rewards_list.append(0.0)
                 dones_list.append(False)
+                valid_list.append(False)  # reset is not a valid move
         
         obs = torch.stack(new_obs_list, dim=0).to(obs.device)
         rewards = torch.tensor(rewards_list, device=obs.device, dtype=torch.float32)
         dones = torch.tensor(dones_list, device=obs.device, dtype=torch.bool)
         
-        # update rewards for Phase-1 completions
-        # phase-1 rewards go to the corresponding Phase-0 transition
+        # update rewards and validity for Phase-1 completions
+        # phase-1 rewards and validity go to the corresponding Phase-0 transition
         if phase1_mask.any():
             phase1_indices = torch.where(phase1_mask)[0]
             for i, env_idx in enumerate(phase1_indices):
                 # find the most recent Phase-0 transition for this env
                 for j in range(len(buffer.phase0_env_indices) - 1, -1, -1):
                     if buffer.phase0_env_indices[j] == env_idx.item():
-                        # assign Phase-1 reward to this Phase-0 transition
+                        # assign Phase-1 reward and validity to this Phase-0 transition
                         buffer.phase0_rewards[j] = torch.tensor([rewards[env_idx].item()], device='cpu')
                         buffer.phase0_dones[j] = torch.tensor([dones[env_idx].item()], device='cpu', dtype=torch.bool)
+                        buffer.phase0_valid[j] = torch.tensor([valid_list[env_idx]], device='cpu', dtype=torch.bool)
                         break
         
         # reset done environments
@@ -796,10 +836,12 @@ def train(config: Config, use_wandb: bool = True):
         
         # re-initialize value head: SFT value estimates are wrong for RL returns
         # keep policy head weights from SFT, but reset value head
+        # use smaller initial weights to prevent high initial grad norms
         print("Re-initializing value head (SFT value estimates don't match RL returns)...")
         for param in policy.value_head.parameters():
             if len(param.shape) >= 2:
-                torch.nn.init.xavier_uniform_(param)
+                # use smaller scale for xavier initialization to prevent high initial gradients
+                torch.nn.init.xavier_uniform_(param, gain=0.5)  # reduced from default gain=1.0
             else:
                 torch.nn.init.zeros_(param)
         
@@ -1176,6 +1218,7 @@ def train(config: Config, use_wandb: bool = True):
                     "phase0/value_loss": avg_phase0_loss.get('value_loss', 0),
                     "phase0/entropy": avg_phase0_loss.get('entropy', 0),
                     "phase0/entropy_penalty": avg_phase0_loss.get('entropy_penalty', 0),
+                    "phase0/entropy_excess_penalty": avg_phase0_loss.get('entropy_excess_penalty', 0),
                     "phase0/clip_fraction": avg_phase0_loss.get('clip_fraction', 0),
                     "exploration/entropy_coef": current_entropy_coef,
                     "exploration/entropy_target": current_entropy_target,
@@ -1202,6 +1245,12 @@ def train(config: Config, use_wandb: bool = True):
                     "phase1/reward_diversity_std": avg_phase1_loss.get('reward_diversity_std', 0),
                     "phase1/reward_range": avg_phase1_loss.get('reward_range', 0),
                     "phase1/relative_advantage_std": avg_phase1_loss.get('relative_advantage_std', 0),
+                    # debug metrics for mean_ratio investigation
+                    "debug/phase1_old_logprobs_mean": avg_phase1_loss.get('debug/old_logprobs_mean', 0),
+                    "debug/phase1_new_logprobs_mean": avg_phase1_loss.get('debug/new_logprobs_mean', 0),
+                    "debug/phase1_ratio_mean": avg_phase1_loss.get('debug/ratio_mean', 0),  # unclamped
+                    "debug/phase1_ratio_mean_clamped": avg_phase1_loss.get('debug/ratio_mean_clamped', 0),  # clamped
+                    "debug/phase1_ratio_max": avg_phase1_loss.get('debug/ratio_max', 0),
                 }, step=update)
         
         # log rollout statistics
@@ -1209,13 +1258,12 @@ def train(config: Config, use_wandb: bool = True):
             # compute statistics from rollouts
             total_rewards = phase0_data["rewards"].sum().item()
             mean_reward = phase0_data["rewards"].mean().item()
-            valid_moves = (phase0_data["rewards"] > 0).sum().item()
-            total_moves = phase0_data["rewards"].numel()
+            valid_moves = phase0_data["valid"].sum().item()  # use actual validity instead of rewards > 0
+            total_moves = phase0_data["valid"].numel()
             
             wandb.log({
                 "rollout/total_reward": total_rewards,
                 "rollout/mean_reward": mean_reward,
-                "rollout/valid_moves": valid_moves,
                 "rollout/total_moves": total_moves,
                 "rollout/legality_rate": valid_moves / max(total_moves, 1),
             }, step=update)
@@ -1269,12 +1317,13 @@ def main():
                        help="Disable legal-only masks even when loading checkpoints")
     args = parser.parse_args()
     
-    # auto-enable legal-only masks when loading SFT checkpoints (unless explicitly disabled)
+    # use legal-only masks only if explicitly requested
     use_legal_only = args.use_legal_only_masks
-    if args.load_checkpoint and not args.no_legal_only_masks:
-        # SFT checkpoints were trained/evaluated with legal-only masks
-        use_legal_only = True
-        print(f"Auto-enabling legal-only masks for SFT checkpoint (use --no-legal-only-masks to disable)")
+    if args.load_checkpoint and not use_legal_only and not args.no_legal_only_masks:
+        # Warn user that SFT checkpoints may need legal-only masks, but don't auto-enable
+        print(f"WARNING: Loading SFT checkpoint without --use-legal-only-masks. "
+              f"SFT checkpoints were trained with legal-only masks. "
+              f"If you see legality issues, try adding --use-legal-only-masks flag.")
     
     config = Config(seed=args.seed, load_checkpoint=args.load_checkpoint, use_legal_only_masks=use_legal_only)
     train(config, use_wandb=not args.no_wandb)

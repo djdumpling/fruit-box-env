@@ -131,15 +131,32 @@ def compute_grpo_loss(
     # count unique rewards (another diversity metric)
     unique_rewards = len(torch.unique(rewards))
     
+    # debug logging for mean_ratio investigation
+    old_logprobs_mean = old_logprobs.mean().item()
+    new_logprobs_mean = new_logprobs.mean().item()
+    ratio_mean_unclamped = ratio.mean().item()
+    ratio_max = ratio.max().item()
+    
+    # clamp ratio before computing mean to prevent outliers from skewing the metric
+    # this prevents mean_ratio explosion when one ratio is huge (e.g., exp(15) = 3.3M)
+    clamped_ratio = torch.clamp(ratio, 0.1, 10.0)
+    ratio_mean = clamped_ratio.mean().item()
+    
     info = {
         "grpo_loss": loss.item(),
         "mean_advantage": advantages.mean().item(),
-        "mean_ratio": ratio.mean().item(),
+        "mean_ratio": ratio_mean,  # use clamped mean for decision making
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),
         "reward_diversity_std": reward_std,  # standard deviation of rewards within group
         "reward_range": reward_range,  # range of rewards (max - min)
         "relative_advantage_std": rel_adv_std,  # std of relative advantages (key diversity metric)
         "unique_reward_count": unique_rewards,  # number of distinct reward values
+        # debug metrics for mean_ratio investigation
+        "debug/old_logprobs_mean": old_logprobs_mean,
+        "debug/new_logprobs_mean": new_logprobs_mean,
+        "debug/ratio_mean": ratio_mean_unclamped,  # unclamped for debugging
+        "debug/ratio_mean_clamped": ratio_mean,  # clamped for comparison
+        "debug/ratio_max": ratio_max,
     }
     
     return loss, info
@@ -174,6 +191,9 @@ def simulate_action_reward(
         base = float(step_info.reward) + legal_action_bonus
 
         # time-weighted penalty application
+        time_weight = 0.0
+        reward_penalty = 0.0
+        penalty_applied = False
 
         if area_penalty_coef > 0 and base > 2:
             if turn_number < early_turn_threshold:
@@ -184,9 +204,30 @@ def simulate_action_reward(
                 time_weight = 0.0
 
             reward_penalty = area_penalty_coef * base * time_weight
-            return base - reward_penalty
+            penalty_applied = True
+            final_reward = base - reward_penalty
+        else:
+            final_reward = base
 
-        return base
+        # Store debug info in a global dict (will be logged by caller)
+        # Note: This is a simple approach; in production you might want to return debug info
+        if not hasattr(simulate_action_reward, '_debug_info'):
+            simulate_action_reward._debug_info = []
+        
+        simulate_action_reward._debug_info.append({
+            'step_info_valid': step_info.valid,
+            'step_info_reward': step_info.reward,
+            'base_reward': base,
+            'turn_number': turn_number,
+            'time_weight': time_weight,
+            'reward_penalty': reward_penalty,
+            'penalty_applied': penalty_applied,
+            'final_reward': final_reward,
+            'area_penalty_coef': area_penalty_coef,
+            'early_turn_threshold': early_turn_threshold,
+        })
+        
+        return final_reward
 
     else:
         # apply penalty for illegal moves (consistent with actual execution)

@@ -172,8 +172,14 @@ def compute_ppo_loss(
         entropy_shortfall = torch.clamp(entropy_target - entropy_bonus, min=0.0)
         entropy_penalty = entropy_penalty_coef * entropy_shortfall
     
+    # entropy ceiling penalty (to prevent entropy explosion) - small coefficient since entropy should stabilize naturally
+    entropy_excess_penalty = 0.0
+    if entropy_target > 0.0:
+        entropy_excess = torch.clamp(entropy_bonus - entropy_target, min=0.0)
+        entropy_excess_penalty = 0.03 * entropy_excess  # small coefficient (0.05) as specified
+    
     # total loss
-    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus + entropy_penalty
+    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus + entropy_penalty + entropy_excess_penalty
     
     # statistics
     info = {
@@ -182,6 +188,7 @@ def compute_ppo_loss(
         "value_loss": value_loss.item(),
         "entropy": entropy_bonus.item(),
         "entropy_penalty": entropy_penalty.item() if isinstance(entropy_penalty, torch.Tensor) else entropy_penalty,
+        "entropy_excess_penalty": entropy_excess_penalty.item() if isinstance(entropy_excess_penalty, torch.Tensor) else entropy_excess_penalty,
         "mean_advantage": advantages.mean().item(),
         "mean_ratio": ratio.mean().item(),
         "clip_fraction": ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item(),
