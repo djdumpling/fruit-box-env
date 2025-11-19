@@ -142,6 +142,8 @@ def load_diverse_dataset(dataset_name: str, dataset_split: str = "train") -> Tup
     return phase0_data, phase1_data
 
 
+
+
 def train(
     checkpoint_path: str,
     dataset_name: str,
@@ -255,23 +257,41 @@ def train(
                 print(f"Batch size: {len(batch_data)}")
                 continue
             
-            # Forward pass
-            # Use more conservative loss weights for diverse dataset with many negatives
-            loss, info = compute_sft_loss(
-                policy,
-                batch_obs,
-                batch_actions,
-                batch_masks,
-                batch_is_positive,
-                negative_loss_weight=1.0,  # Reduced from 2.0
-                legal_actions_sets=legal_actions_sets,
-                illegal_mass_alpha=1.0,  # Reduced from 2.0
-                illegal_mass_beta=1.5,  # Reduced from 3.0
-                topk_illegal_k=10,
-                topk_illegal_delta=2.5,  # Reduced from 5.0
-                legal_mass_bonus_zeta=0.25,  # Reduced from 0.5
-                use_set_based_losses=True,
-            )
+            # Clamp logits to prevent extreme values that cause inf losses
+            # Temporarily wrap policy forward to clamp logits
+            original_forward = policy.forward
+            def clamped_forward(obs, masks):
+                logits, hidden = original_forward(obs, masks)
+                # Clamp logits to prevent extreme softmax values
+                logits = torch.clamp(logits, min=-20.0, max=20.0)
+                # Replace any NaN/Inf with safe values
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+                return logits, hidden
+            
+            policy.forward = clamped_forward
+            
+            try:
+                # Forward pass using computation logic from train_sft.py
+                # Use conservative loss weights for diverse dataset with many negatives
+                loss, info = compute_sft_loss(
+                    policy,
+                    batch_obs,
+                    batch_actions,
+                    batch_masks,
+                    batch_is_positive,
+                    negative_loss_weight=1.0,  # Reduced from 2.0 for stability
+                    legal_actions_sets=legal_actions_sets,
+                    illegal_mass_alpha=1.0,  # Reduced from 2.0
+                    illegal_mass_beta=1.5,  # Reduced from 3.0
+                    topk_illegal_k=10,
+                    topk_illegal_delta=2.5,  # Reduced from 5.0
+                    legal_mass_bonus_zeta=0.25,  # Reduced from 0.5
+                    use_set_based_losses=True,
+                )
+            finally:
+                # Restore original forward method
+                policy.forward = original_forward
             
             # Check for NaN/inf in loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -279,8 +299,8 @@ def train(
                 print(f"  Info: {info}")
                 continue
             
-            # Clamp loss to prevent extreme values (more conservative)
-            loss = torch.clamp(loss, min=-50.0, max=50.0)
+            # Clamp loss to prevent extreme values
+            loss = torch.clamp(loss, min=-100.0, max=100.0)
             
             # Backward pass
             optimizer.zero_grad()
