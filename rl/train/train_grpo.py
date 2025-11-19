@@ -376,42 +376,63 @@ def collect_rollouts(
         # get action masks and phases
         masks_list = []
         phases = []
+        phase0_legal_anchor_counts = []  # debug: track legal anchor counts
+        phase1_legal_extent_counts = []   # debug: track legal extent counts
+        
         for env in envs:
-            if config.use_legal_only_masks:
-                # use legal-only masks (required when loading from SFT)
-                if env.phase == 0:
-                    # phase-0: compute legal anchors (anchors with at least one legal extent)
-                    legal_anchors_set = set()
-                    grid = env.game_env.grid
-                    for anchor_r1 in range(10):
-                        for anchor_c1 in range(17):
-                            anchor_idx = env.anchor_to_flat_idx(anchor_r1, anchor_c1)
-                            # check if this anchor has any legal extents
-                            max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
-                            has_legal = False
-                            for extent_idx in range(max_valid_count):
-                                r2_test, c2_test = env.flat_idx_to_extent(anchor_r1, anchor_c1, extent_idx)
-                                if env.game_env.box_sum(anchor_r1, anchor_c1, r2_test, c2_test) == 10:
-                                    reward_test = env.game_env.box_nonzero_count(anchor_r1, anchor_c1, r2_test, c2_test)
-                                    if reward_test > 0:
-                                        has_legal = True
-                                        break
-                            if has_legal:
-                                legal_anchors_set.add(anchor_idx)
-                    # build mask: True only at legal anchor positions
-                    mask = torch.zeros(170, dtype=torch.bool)
-                    for legal_anchor_idx in sorted(legal_anchors_set):
-                        mask[legal_anchor_idx] = True
-                else:
-                    # phase-1: use legal-only mask (only extents that sum to 10)
-                    # get_legal_only_mask() returns compact mask, we'll handle padding later
-                    mask = env.get_legal_only_mask()
+            if env.phase == 0:
+                # Phase-0: Use all geometrically valid anchors (matching test_sft.py and SFT training)
+                # SFT trained with include_negative_examples=True, so it learned to avoid illegal anchors
+                # We should trust the policy and use all anchors, letting it choose legal ones
+                mask = env.get_action_mask()  # All geometrically valid anchors (170 for Phase-0)
+                
+                # Count legal anchors for debug (anchors with at least one legal extent)
+                legal_anchors_set = set()
+                grid = env.game_env.grid
+                for anchor_r1 in range(10):
+                    for anchor_c1 in range(17):
+                        anchor_idx = env.anchor_to_flat_idx(anchor_r1, anchor_c1)
+                        max_valid_count = (10 - anchor_r1) * (17 - anchor_c1)
+                        has_legal = False
+                        for extent_idx in range(max_valid_count):
+                            r2_test, c2_test = env.flat_idx_to_extent(anchor_r1, anchor_c1, extent_idx)
+                            if env.game_env.box_sum(anchor_r1, anchor_c1, r2_test, c2_test) == 10:
+                                reward_test = env.game_env.box_nonzero_count(anchor_r1, anchor_c1, r2_test, c2_test)
+                                if reward_test > 0:
+                                    has_legal = True
+                                    break
+                        if has_legal:
+                            legal_anchors_set.add(anchor_idx)
+                phase0_legal_anchor_counts.append(len(legal_anchors_set))
             else:
-                # use standard action mask (all geometrically valid actions)
-                # policy learned legality in SFT, so it can handle all actions and avoid illegal ones
-                mask = env.get_action_mask()
+                # phase-1: get mask based on configuration
+                if config.use_legal_only_masks:
+                    # use legal-only mask (only extents that sum to 10)
+                    mask = env.get_legal_only_mask()
+                else:
+                    # use standard action mask (all geometrically valid actions)
+                    # But we'll filter to legal actions later in Phase-1 processing
+                    mask = env.get_action_mask()
+                # Count legal extents for debug
+                legal_mask = env.get_legal_only_mask()
+                phase1_legal_extent_counts.append(legal_mask.sum().item() if legal_mask.numel() > 0 else 0)
             masks_list.append(mask)
             phases.append(env.phase)
+        
+        # Debug logging for mask statistics
+        if step == 0 and current_update is not None and current_update % 10 == 0:
+            phase0_count = sum(1 for p in phases if p == 0)
+            phase1_count = sum(1 for p in phases if p == 1)
+            if phase0_legal_anchor_counts:
+                avg_legal_anchors = sum(phase0_legal_anchor_counts) / len(phase0_legal_anchor_counts)
+                min_legal_anchors = min(phase0_legal_anchor_counts)
+                max_legal_anchors = max(phase0_legal_anchor_counts)
+                print(f"[DEBUG Step {step}] Phase-0: {phase0_count} envs, legal anchors: avg={avg_legal_anchors:.1f}, min={min_legal_anchors}, max={max_legal_anchors}")
+            if phase1_legal_extent_counts:
+                avg_legal_extents = sum(phase1_legal_extent_counts) / len(phase1_legal_extent_counts)
+                min_legal_extents = min(phase1_legal_extent_counts)
+                max_legal_extents = max(phase1_legal_extent_counts)
+                print(f"[DEBUG Step {step}] Phase-1: {phase1_count} envs, legal extents: avg={avg_legal_extents:.1f}, min={min_legal_extents}, max={max_legal_extents}")
         
         # separate Phase-0 and Phase-1 envs
         phase0_indices = [i for i, p in enumerate(phases) if p == 0]
@@ -449,6 +470,9 @@ def collect_rollouts(
                 )
         
         # phase-1: select extent with GRPO
+        # Store phase1_no_legal_actions_envs as function attribute for use in validity update
+        collect_rollouts._phase1_no_legal_envs = set()
+        
         if phase1_mask.any():
             phase1_obs = obs[phase1_mask]
             phase1_masks_list = [masks_list[i] for i in phase1_indices]
@@ -466,6 +490,7 @@ def collect_rollouts(
             all_candidates_actions = []
             all_candidates_logprobs = []
             all_candidates_rewards = []
+            phase1_no_legal_actions_envs = set()  # Track envs where Phase-0 selected anchor with no legal extents
             
             for i, env_idx in enumerate(phase1_env_indices):
                 env = envs[env_idx]
@@ -489,24 +514,12 @@ def collect_rollouts(
                     valid_mask[:valid_mask_compact.shape[0]] = valid_mask_compact[:170]
                 valid_action_count = valid_mask.sum().item()
                 
-                # CRITICAL FIX: When not using legal-only masks, we need to filter to only legal actions
-                # The policy learned legality, but stochastic sampling can still pick illegal actions
-                # So we filter the mask to only include legal actions before sampling
-                if not config.use_legal_only_masks:
-                    # Get legal-only mask to filter out illegal actions
-                    legal_mask_compact = env.get_legal_only_mask()
-                    # Map legal mask to full 170-space (same logic as valid_mask)
-                    legal_mask_full = torch.zeros(170, dtype=torch.bool, device=obs.device)
-                    if legal_mask_compact.shape[0] <= action_dim:
-                        for compact_idx in range(min(legal_mask_compact.shape[0], action_dim)):
-                            if legal_mask_compact[compact_idx]:
-                                legal_mask_full[compact_idx] = True
-                    else:
-                        legal_mask_full[:legal_mask_compact.shape[0]] = legal_mask_compact[:170]
-                    
-                    # Intersect valid_mask with legal_mask_full to get only legal actions
-                    valid_mask = valid_mask & legal_mask_full
-                    valid_action_count = valid_mask.sum().item()
+                # Note: We use all geometrically valid actions (matching SFT training)
+                # SFT trained with include_negative_examples=True, so mask included all geometric actions
+                # The policy learned to avoid illegal actions through set-based losses
+                # We trust the policy and use all geometric actions, letting it choose legal ones
+                # (Unlike test_sft.py which uses argmax, we use stochastic sampling, but the policy
+                #  should have learned to put very low probability on illegal actions)
                 
                 # enhanced debug logging for Phase-1 (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
@@ -526,12 +539,19 @@ def collect_rollouts(
                         "debug/phase1_legal_count": legal_count,
                     }, commit=False)
                 
-                # skip if no valid actions (shouldn't happen in normal flow, but handle gracefully)
+                # skip if no valid actions (happens when Phase-0 selected anchor with no legal extents)
                 if valid_action_count == 0:
-                    # use dummy values - this shouldn't happen if curriculum/constraints work correctly
+                    # This means Phase-0 selected an anchor with no legal extents
+                    # We'll mark the corresponding Phase-0 transition as invalid when we update validity
+                    # For now, use dummy values and skip candidate sampling
                     all_candidates_actions.append(torch.zeros(config.grpo_k, dtype=torch.long, device=obs.device))
                     all_candidates_logprobs.append(torch.zeros(config.grpo_k, device=obs.device))
                     all_candidates_rewards.append(torch.zeros(config.grpo_k, device=obs.device))
+                    # Track that this Phase-1 has no legal actions so we can mark Phase-0 as invalid
+                    phase1_no_legal_actions_envs.add(env_idx)
+                    collect_rollouts._phase1_no_legal_envs.add(env_idx)
+                    if current_update is not None and current_update % 10 == 0:
+                        print(f"[DEBUG Step {step}] Phase-1 env {env_idx} has 0 legal actions (anchor has no legal extents)")
                     continue
                 
                 # sample K candidates
@@ -740,52 +760,53 @@ def collect_rollouts(
         dones = torch.tensor(dones_list, device=obs.device, dtype=torch.bool)
         
         # update rewards and validity for Phase-1 completions
-        # CRITICAL: Phase-1 completions happen when we step envs that were in Phase-1 at the START of this step
-        # These envs had Phase-0 transitions added in the PREVIOUS step
-        # So we need to match Phase-1 completions (from envs that were Phase-1) to Phase-0 transitions
-        # The key insight: envs that are Phase-1 NOW were Phase-0 in the PREVIOUS step
-        # But wait - actually, Phase-0 and Phase-1 transitions are added in the SAME step for different envs
-        # Then we step all envs. So:
-        # - Env A: Phase-0 → add Phase-0 transition → step → becomes Phase-1
-        # - Env B: Phase-1 → add Phase-1 transition → step → becomes Phase-0 or resets
-        # So Phase-0 transitions added this step will be completed next step when those envs become Phase-1
-        # But Phase-1 transitions added this step complete immediately when we step
-        # So we need to match Phase-1 completions (from stepping Phase-1 envs) to Phase-0 transitions from PREVIOUS step
-        # Actually wait - let me reconsider. The phases at the START of the step determine what we do:
-        # - If Phase-0: we add Phase-0 transition, then step → becomes Phase-1
-        # - If Phase-1: we add Phase-1 transition, then step → completes the move, becomes Phase-0
-        # So Phase-1 transitions added this step complete when we step (same step)
-        # But Phase-0 transitions added this step will complete next step
-        # So we need to match Phase-1 completions to Phase-0 transitions from PREVIOUS step
-        # But we're updating in the same step, so we need to match to Phase-0 transitions that were added
-        # when these envs were Phase-0, which was the PREVIOUS step
+        # Match Phase-1 completions (from stepping Phase-1 envs) to the most recent Phase-0 transition for each env
+        phase1_matched_count = 0
+        phase1_unmatched_count = 0
+        phase1_no_legal_actions_count = 0
         
-        # Actually, the simplest approach: match Phase-1 completions (from stepping Phase-1 envs) 
-        # to the most recent Phase-0 transition for each env
         if phase1_mask.any():
             phase1_indices = torch.where(phase1_mask)[0]
             for i, env_idx_tensor in enumerate(phase1_indices):
                 env_idx = env_idx_tensor.item()
                 # Find the most recent Phase-0 transition for this env
-                # This should be from the previous step when this env was Phase-0
                 found = False
                 for j in range(len(buffer.phase0_env_indices) - 1, -1, -1):
                     if buffer.phase0_env_indices[j] == env_idx:
                         # This Phase-0 transition corresponds to this Phase-1 completion
-                        # CRITICAL: valid_list is indexed by env_idx (0 to num_envs-1)
                         if env_idx < len(valid_list):
-                            is_valid = valid_list[env_idx]
+                            # Check if Phase-1 had no legal actions (Phase-0 selected anchor with no legal extents)
+                            if hasattr(collect_rollouts, '_phase1_no_legal_envs') and env_idx in collect_rollouts._phase1_no_legal_envs:
+                                is_valid = False
+                                phase1_no_legal_actions_count += 1
+                                if current_update is not None and current_update % 10 == 0:
+                                    print(f"[DEBUG Step {step}] Marking Phase-0 transition invalid: env {env_idx} selected anchor with no legal extents")
+                            else:
+                                is_valid = valid_list[env_idx]
+                            
                             buffer.phase0_rewards[j] = torch.tensor([rewards[env_idx].item()], device='cpu')
                             buffer.phase0_dones[j] = torch.tensor([dones[env_idx].item()], device='cpu', dtype=torch.bool)
                             buffer.phase0_valid[j] = torch.tensor([is_valid], device='cpu', dtype=torch.bool)
+                            phase1_matched_count += 1
                             found = True
                         else:
-                            print(f"WARNING: env_idx {env_idx} >= len(valid_list) {len(valid_list)}")
+                            if current_update is not None and current_update % 10 == 0:
+                                print(f"[DEBUG Step {step}] WARNING: env_idx {env_idx} >= len(valid_list) {len(valid_list)}")
                             buffer.phase0_valid[j] = torch.tensor([False], device='cpu', dtype=torch.bool)
                         break
-                if not found and step > 0:  # Allow first step to not have matches
-                    # This can happen if env resets or if Phase-0 transition wasn't added
-                    pass  # Phase-0 transition stays with initial values (reward=0, valid=False)
+                if not found:
+                    phase1_unmatched_count += 1
+                    if step > 0 and current_update is not None and current_update % 10 == 0:
+                        print(f"[DEBUG Step {step}] WARNING: No Phase-0 transition found for env_idx {env_idx} (Phase-1 completion)")
+        
+        # Debug logging for matching statistics
+        if step == config.rollout_steps - 1 and current_update is not None and current_update % 10 == 0:
+            total_phase0 = len(buffer.phase0_env_indices)
+            print(f"[DEBUG End of Rollout] Phase-0 transitions: {total_phase0}, Phase-1 matched: {phase1_matched_count}, unmatched: {phase1_unmatched_count}, no legal actions: {phase1_no_legal_actions_count}")
+        
+        # Clear the function attribute for next step
+        if hasattr(collect_rollouts, '_phase1_no_legal_envs'):
+            collect_rollouts._phase1_no_legal_envs.clear()
         
         # reset done environments
         for env_idx, done in enumerate(dones):
@@ -1406,12 +1427,28 @@ def train(config: Config, use_wandb: bool = True):
                 "debug/rollout_never_updated_count": never_updated,
             }, step=update)
             
-            # Print warning if legality rate is suspiciously low
+            # Print detailed debug info if legality rate is suspiciously low
             if validity_rate < 0.5 and update % 10 == 0:
-                print(f"WARNING: Low legality rate {validity_rate:.2%} at update {update}")
-                print(f"  Valid moves: {valid_moves}/{total_moves}")
-                print(f"  Rewards > 0: {rewards_positive}/{total_moves}")
+                print(f"\n[DEBUG Update {update}] Low legality rate {validity_rate:.2%}")
+                print(f"  Valid moves: {valid_moves}/{total_moves} ({validity_rate:.2%})")
+                print(f"  Rewards > 0: {rewards_positive}/{total_moves} ({reward_positive_rate:.2%})")
                 print(f"  Never updated: {never_updated}/{total_moves}")
+                print(f"  Total rewards: {total_rewards:.1f}, Mean reward: {mean_reward:.3f}")
+                
+                # Check if rewards and validity match (they should)
+                if rewards_positive != valid_moves:
+                    print(f"  MISMATCH: rewards_positive ({rewards_positive}) != valid_moves ({valid_moves})")
+                
+                # Check Phase-0 and Phase-1 data
+                if phase1_data:
+                    phase1_count = len(phase1_data.get("executed_actions", []))
+                    print(f"  Phase-1 transitions: {phase1_count}")
+                    if phase1_count > 0:
+                        phase1_rewards = phase1_data.get("executed_rewards", torch.tensor([]))
+                        if isinstance(phase1_rewards, torch.Tensor) and phase1_rewards.numel() > 0:
+                            phase1_positive = (phase1_rewards > 0).sum().item()
+                            print(f"  Phase-1 rewards > 0: {phase1_positive}/{phase1_rewards.numel()}")
+                print()
         
         # Set policy back to eval mode for next rollout collection
         policy.eval()
