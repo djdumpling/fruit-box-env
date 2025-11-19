@@ -489,13 +489,37 @@ def collect_rollouts(
                     valid_mask[:valid_mask_compact.shape[0]] = valid_mask_compact[:170]
                 valid_action_count = valid_mask.sum().item()
                 
+                # CRITICAL FIX: When not using legal-only masks, we need to filter to only legal actions
+                # The policy learned legality, but stochastic sampling can still pick illegal actions
+                # So we filter the mask to only include legal actions before sampling
+                if not config.use_legal_only_masks:
+                    # Get legal-only mask to filter out illegal actions
+                    legal_mask_compact = env.get_legal_only_mask()
+                    # Map legal mask to full 170-space (same logic as valid_mask)
+                    legal_mask_full = torch.zeros(170, dtype=torch.bool, device=obs.device)
+                    if legal_mask_compact.shape[0] <= action_dim:
+                        for compact_idx in range(min(legal_mask_compact.shape[0], action_dim)):
+                            if legal_mask_compact[compact_idx]:
+                                legal_mask_full[compact_idx] = True
+                    else:
+                        legal_mask_full[:legal_mask_compact.shape[0]] = legal_mask_compact[:170]
+                    
+                    # Intersect valid_mask with legal_mask_full to get only legal actions
+                    valid_mask = valid_mask & legal_mask_full
+                    valid_action_count = valid_mask.sum().item()
+                
                 # enhanced debug logging for Phase-1 (log every 50 updates)
                 if current_update is not None and current_update % 50 == 0:
-                    # count legal actions if curriculum is active
-                    legal_count = valid_action_count
-                    if env.curriculum_legal_only and env.current_update < env.curriculum_updates * 2:
-                        legal_mask = env.get_legal_only_mask()
-                        legal_count = legal_mask.sum().item() if legal_mask.numel() > 0 else 0
+                    # count legal actions
+                    legal_mask_compact = env.get_legal_only_mask()
+                    legal_mask_full = torch.zeros(170, dtype=torch.bool, device=obs.device)
+                    if legal_mask_compact.shape[0] <= action_dim:
+                        for compact_idx in range(min(legal_mask_compact.shape[0], action_dim)):
+                            if legal_mask_compact[compact_idx]:
+                                legal_mask_full[compact_idx] = True
+                    else:
+                        legal_mask_full[:legal_mask_compact.shape[0]] = legal_mask_compact[:170]
+                    legal_count = legal_mask_full.sum().item()
                     
                     wandb.log({
                         "debug/phase1_valid_action_count": valid_action_count,
@@ -514,7 +538,7 @@ def collect_rollouts(
                 # for Phase-1, we need to create a full-size mask (170) with only valid positions
                 # Phase-1 action space is variable, so we pad the mask
                 full_mask = torch.zeros(170, dtype=torch.bool, device=obs.device)
-                # find indices where valid_mask is True
+                # find indices where valid_mask is True (now filtered to only legal actions)
                 valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).to(obs.device)
                 # ensure valid_indices is 1D (squeeze might make it 0D if empty, but we already checked valid_action_count > 0)
                 if valid_indices.dim() == 0:
