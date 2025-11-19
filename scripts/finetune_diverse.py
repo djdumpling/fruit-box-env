@@ -257,38 +257,55 @@ def train(
                 print(f"Batch size: {len(batch_data)}")
                 continue
             
-            # Clamp logits to prevent extreme values that cause inf losses
-            # Temporarily wrap policy forward to clamp logits
+            # Clamp logits very aggressively to prevent extreme softmax values
+            # Use [-5, 5] to keep probabilities in [~0.0067, ~0.9933] range
+            # This prevents -log1p(-p) from becoming too large
             original_forward = policy.forward
             def clamped_forward(obs, masks):
                 logits, hidden = original_forward(obs, masks)
-                # Clamp logits to prevent extreme softmax values
-                logits = torch.clamp(logits, min=-20.0, max=20.0)
+                # Very aggressive clamping: [-5, 5] keeps softmax in safe range
+                # This ensures probabilities stay roughly in [0.0067, 0.9933]
+                # So -log1p(-p) stays roughly in [0.0067, 5.0] range (much safer)
+                logits = torch.clamp(logits, min=-5.0, max=5.0)
                 # Replace any NaN/Inf with safe values
                 if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
                 return logits, hidden
             
             policy.forward = clamped_forward
             
             try:
                 # Forward pass using computation logic from train_sft.py
-                # Use conservative loss weights for diverse dataset with many negatives
+                # Use very conservative loss weights for diverse dataset with many negatives
+                # The topk_illegal_delta is especially important since it multiplies -log1p(-p) terms
                 loss, info = compute_sft_loss(
                     policy,
                     batch_obs,
                     batch_actions,
                     batch_masks,
                     batch_is_positive,
-                    negative_loss_weight=1.0,  # Reduced from 2.0 for stability
+                    negative_loss_weight=0.5,  # Further reduced for stability
                     legal_actions_sets=legal_actions_sets,
-                    illegal_mass_alpha=1.0,  # Reduced from 2.0
-                    illegal_mass_beta=1.5,  # Reduced from 3.0
+                    illegal_mass_alpha=0.5,  # Further reduced
+                    illegal_mass_beta=0.75,  # Further reduced
                     topk_illegal_k=10,
-                    topk_illegal_delta=2.5,  # Reduced from 5.0
-                    legal_mass_bonus_zeta=0.25,  # Reduced from 0.5
+                    topk_illegal_delta=1.0,  # Much reduced - this multiplies -log1p(-p) which can be large
+                    legal_mass_bonus_zeta=0.1,  # Further reduced
                     use_set_based_losses=True,
                 )
+                
+                # Additional safety: check for inf/nan and clamp loss
+                # With [-5, 5] logit clamping, this should rarely happen, but just in case
+                if torch.isnan(loss) or torch.isinf(loss):
+                    # If loss is still inf/nan despite aggressive clamping, use fallback
+                    loss = torch.tensor(5.0, device=loss.device, requires_grad=True)
+                    info['loss'] = 5.0
+                    print(f"Warning: Loss was inf/nan after clamping, using fallback. Info: {info}")
+                else:
+                    # Clamp loss to reasonable range
+                    loss = torch.clamp(loss, min=-100.0, max=100.0)
+                    info['loss'] = loss.item()
+                    
             finally:
                 # Restore original forward method
                 policy.forward = original_forward
