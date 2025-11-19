@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 import wandb
 
 from rl.models.policy import CNNPolicy
@@ -31,6 +31,7 @@ class Config:
     # data
     dataset_name: str = "djdumpling/fruit-box-minimal-area"
     dataset_split: str = "train"
+    extra_jsonl: Optional[str] = None
     
     # training
     epochs: int = 200
@@ -70,6 +71,7 @@ class Config:
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 5
+    init_checkpoint: Optional[str] = None
 
 
 def anchor_to_flat_idx(r1: int, c1: int) -> int:
@@ -326,6 +328,7 @@ def load_and_process_dataset(
     seed: Optional[int] = None,
     include_negative_examples: bool = True,
     negative_example_ratio: float = 0.5,
+    extra_jsonl: Optional[str] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Load dataset and convert to Phase-0/Phase-1 examples
     
@@ -338,6 +341,16 @@ def load_and_process_dataset(
     
     hf_dataset = load_dataset(dataset_name, split=dataset_split)
     print(f"Loaded dataset {dataset_name} (split: {dataset_split})...")
+    
+    if extra_jsonl:
+        print(f"Loading extra corrective dataset from {extra_jsonl}...")
+        extra_ds = load_dataset(
+            "json",
+            data_files={"train": extra_jsonl},
+            split="train",
+        )
+        hf_dataset = concatenate_datasets([hf_dataset, extra_ds])
+        print(f"Combined dataset size: {len(hf_dataset)} rows")
     
     # group trajectories by episode_id and agent_tag
     episodes = {}
@@ -1011,11 +1024,17 @@ def train(config: Config):
         seed=config.seed,
         include_negative_examples=config.include_negative_examples,
         negative_example_ratio=config.negative_example_ratio,
+        extra_jsonl=config.extra_jsonl,
     )
     
     # create model
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
-    print("Model created")
+    if config.init_checkpoint:
+        state_dict = torch.load(config.init_checkpoint, map_location=device)
+        policy.load_state_dict(state_dict)
+        print(f"Model initialized from checkpoint: {config.init_checkpoint}")
+    else:
+        print("Model created from scratch")
     
     # create optimizer
     optimizer = torch.optim.Adam(policy.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -1399,8 +1418,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area")
     parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--extra_jsonl", type=str, default=None, help="Optional local JSONL with corrective data")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint_interval", type=int, default=20)
+    parser.add_argument("--init_checkpoint", type=str, default=None, help="Optional initial checkpoint to warm start")
     args = parser.parse_args()
     
     config = Config(
@@ -1411,8 +1432,10 @@ def main():
         weight_decay=args.weight_decay,
         dataset_name=args.dataset_name,
         dataset_split=args.dataset_split,
+        extra_jsonl=args.extra_jsonl,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_interval=args.checkpoint_interval,
+        init_checkpoint=args.init_checkpoint,
     )
     
     train(config)
