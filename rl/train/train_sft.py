@@ -561,7 +561,7 @@ def log_example_moves(
     """Log example moves predicted by the model"""
     policy.eval()
     with torch.no_grad():
-        logits, _ = policy(obs, masks)
+        logits, _, _ = policy(obs, masks)  # ignore value and sum_predictions for logging
         
         examples_logged = 0
         for i in range(min(num_examples, len(batch_data))):
@@ -724,6 +724,7 @@ def compute_sft_loss(
     use_context_aware_reward_weighting: bool = True,
     context_aware_early_threshold: float = 0.5,
     context_aware_trajectory_threshold: int = 20,
+    sum_prediction_loss_weight: float = 0.1,  # weight for MSE loss on sum predictions
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute SFT loss with set-based legality losses
     
@@ -734,8 +735,68 @@ def compute_sft_loss(
     - Illegal mass loss: penalize sum of probabilities on ALL illegal actions
     - Top-K illegal loss: penalize top-K illegal actions by probability
     - Legal mass bonus: reward high probability on legal actions
+    
+    Sum prediction loss:
+    - MSE loss between predicted and actual rectangle sums (only for Phase-1 examples)
     """
-    logits, _ = policy(obs, masks)  # [batch_size, 170]
+    logits, value, sum_predictions = policy(obs, masks)  # [batch_size, 170] for logits and sum_predictions
+    
+    # Extract grid from observation (Channel 0: normalized values * 9.0)
+    # Extract phase from observation (Channel 3)
+    # Extract anchor position from observation (Channel 2) for Phase-1
+    grids = (obs[:, 0, :, :] * 9.0).cpu().numpy().astype(np.uint8)  # [batch_size, 10, 17]
+    phases = obs[:, 3, 0, 0].cpu().numpy()  # [batch_size] - 0.0 for Phase-0, 1.0 for Phase-1
+    
+    # Compute actual rectangle sums for Phase-1 examples
+    sum_prediction_losses = []
+    sum_prediction_errors = []
+    temp_env = Sum10Env()
+    
+    for b in range(obs.size(0)):
+        if phases[b] > 0.5:  # Phase-1 (extent selection)
+            # Extract anchor position from Channel 2
+            anchor_mask = obs[b, 2, :, :].cpu().numpy()  # [10, 17]
+            anchor_pos = np.argwhere(anchor_mask > 0.5)
+            if len(anchor_pos) == 0:
+                continue  # No anchor selected, skip sum prediction loss
+            r1, c1 = int(anchor_pos[0][0]), int(anchor_pos[0][1])
+            
+            # Get grid state
+            grid = grids[b]
+            temp_env.reset(grid=grid.copy())
+            
+            # Compute actual sums for all valid extent candidates
+            mask = masks[b].cpu().numpy()  # [170]
+            valid_indices = np.where(mask)[0]
+            
+            actual_sums = np.zeros(170, dtype=np.float32)
+            for extent_idx in valid_indices:
+                r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
+                # Safety check: ensure extent is within bounds
+                if 0 <= r2 < 10 and 0 <= c2 < 17 and r1 <= r2 and c1 <= c2:
+                    actual_sum = temp_env.box_sum(r1, c1, r2, c2)
+                    actual_sums[extent_idx] = float(actual_sum)
+                # If out of bounds, actual_sum remains 0 (invalid extent)
+            
+            # Compute MSE loss for sum predictions (only on valid actions)
+            valid_sum_predictions = sum_predictions[b][valid_indices]  # [valid_count]
+            valid_actual_sums = torch.from_numpy(actual_sums[valid_indices]).to(sum_predictions.device)  # [valid_count]
+            
+            if len(valid_indices) > 0:
+                mse_loss = F.mse_loss(valid_sum_predictions, valid_actual_sums)
+                sum_prediction_losses.append(mse_loss)
+                
+                # Track mean absolute error for logging
+                mae = torch.mean(torch.abs(valid_sum_predictions - valid_actual_sums))
+                sum_prediction_errors.append(mae.item())
+    
+    # Aggregate sum prediction loss
+    if sum_prediction_losses:
+        sum_pred_loss = torch.stack(sum_prediction_losses).mean()
+    else:
+        # No Phase-1 examples in this batch - create zero tensor that can be part of computation graph
+        sum_pred_loss = torch.tensor(0.0, device=obs.device, requires_grad=True)
+    mean_sum_error = np.mean(sum_prediction_errors) if sum_prediction_errors else 0.0
     
     # compute loss for each sample
     losses = []
@@ -930,7 +991,7 @@ def compute_sft_loss(
             # during curriculum phase we only expose legal actions, so treat as legal
             legal_prediction_count += 1
     
-    # combine standard losses and set-based losses
+    # combine standard losses, set-based losses, and sum prediction loss
     if len(losses) == 0:
         loss = torch.tensor(0.0, device=obs.device, requires_grad=True)
     else:
@@ -940,6 +1001,9 @@ def compute_sft_loss(
             loss = standard_loss + set_based_loss
         else:
             loss = standard_loss
+        
+        # Add sum prediction loss
+        loss = loss + sum_prediction_loss_weight * sum_pred_loss
     
         accuracy = correct / total if total > 0 else 0.0
     negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
@@ -960,6 +1024,8 @@ def compute_sft_loss(
         'legal_mass': avg_legal_mass,
         'legal_predictions': legal_prediction_count,
         'total_predictions': total_prediction_count,
+        'sum_prediction_loss': sum_pred_loss.item() if isinstance(sum_pred_loss, torch.Tensor) else sum_pred_loss,
+        'sum_prediction_mae': mean_sum_error,
     }
     
     return loss, info
@@ -1288,6 +1354,7 @@ def train(config: Config):
                 use_context_aware_reward_weighting=config.use_context_aware_reward_weighting,
                 context_aware_early_threshold=config.context_aware_early_threshold,
                 context_aware_trajectory_threshold=config.context_aware_trajectory_threshold,
+                sum_prediction_loss_weight=0.1,  # weight for sum prediction MSE loss
             )
             
             # backward pass

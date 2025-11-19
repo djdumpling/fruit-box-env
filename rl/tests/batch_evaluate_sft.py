@@ -83,7 +83,7 @@ def run_policy_on_grid(
             break
         
         with torch.no_grad():
-            logits, _ = policy(phase0_obs, phase0_mask)
+            logits, _, _ = policy(phase0_obs, phase0_mask)  # ignore value and sum_predictions
             # extract logits only at legal anchor positions
             legal_anchor_indices = torch.nonzero(phase0_mask[0], as_tuple=False).squeeze(-1)
             valid_logits = logits[0][legal_anchor_indices]
@@ -107,7 +107,7 @@ def run_policy_on_grid(
         phase1_mask_padded = padded_mask.unsqueeze(0).to(device)  # [1, 170]
         
         with torch.no_grad():
-            logits, _ = policy(phase1_obs, phase1_mask_padded)
+            logits, _, _ = policy(phase1_obs, phase1_mask_padded)  # ignore value and sum_predictions
             # extract logits only at legal positions
             if valid_indices.numel() > 0:
                 valid_count = valid_indices.numel()

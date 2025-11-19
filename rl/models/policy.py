@@ -52,7 +52,14 @@ class CNNPolicy(nn.Module):
         
         # separate policy heads for Phase-0 (anchor selection) and Phase-1 (extent selection)
         self.phase0_head = nn.Linear(256, action_dim)  # anchor selection
-        self.phase1_head = nn.Linear(256, action_dim)  # extent selection
+        
+        # sum prediction head: predicts rectangle sum for each extent action
+        # Only used in Phase-1 (extent selection)
+        self.sum_prediction_head = nn.Linear(256, action_dim)  # sum prediction for each extent
+        
+        # Phase-1 head: concatenates features with sum predictions
+        # Input: 256 (features) + action_dim (sum predictions) = 256 + action_dim
+        self.phase1_head = nn.Linear(256 + action_dim, action_dim)  # extent selection
         
         # value head
         self.value_head = nn.Linear(256, 1)
@@ -61,7 +68,7 @@ class CNNPolicy(nn.Module):
         self,
         obs: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
         
         Args:
@@ -72,6 +79,7 @@ class CNNPolicy(nn.Module):
         Returns:
             logits: [batch_size, action_dim] policy logits
             value: [batch_size, 1] value estimate
+            sum_predictions: [batch_size, action_dim] predicted rectangle sums (for Phase-1, zeros for Phase-0)
         """
         # extract features
         x = self.feature_extractor(obs)  # [batch, 64, 8, 15]
@@ -84,11 +92,18 @@ class CNNPolicy(nn.Module):
         phase_indicator = obs[:, 3, 0, 0]  # [batch] - take any pixel from phase mask channel
         is_phase1 = phase_indicator > 0.5  # [batch] - True for Phase-1
         
-        # use separate heads based on phase
+        # Phase-0: anchor selection (no sum prediction needed)
         phase0_logits = self.phase0_head(x)  # [batch, action_dim]
-        phase1_logits = self.phase1_head(x)  # [batch, action_dim]
         
-        # select logits based on phase
+        # Phase-1: extent selection (with sum prediction)
+        # First, predict sums for all extent candidates
+        sum_predictions = self.sum_prediction_head(x)  # [batch, action_dim]
+        
+        # Concatenate features with sum predictions for Phase-1 head
+        phase1_features = torch.cat([x, sum_predictions], dim=1)  # [batch, 256 + action_dim]
+        phase1_logits = self.phase1_head(phase1_features)  # [batch, action_dim]
+        
+        # Select logits based on phase
         # use torch.where to select: if is_phase1, use phase1_logits, else phase0_logits
         logits = torch.where(
             is_phase1.unsqueeze(-1),  # [batch, 1] - broadcast to action_dim
@@ -96,15 +111,24 @@ class CNNPolicy(nn.Module):
             phase0_logits
         )  # [batch, action_dim]
         
+        # For Phase-0, set sum predictions to zero (not used)
+        sum_predictions = torch.where(
+            is_phase1.unsqueeze(-1),  # [batch, 1] - broadcast to action_dim
+            sum_predictions,
+            torch.zeros_like(sum_predictions)
+        )  # [batch, action_dim]
+        
         # apply action mask
         if action_mask is not None:
             # set invalid actions to very negative value
             logits = logits.masked_fill(~action_mask, -1e9)
+            # also mask sum predictions for invalid actions
+            sum_predictions = sum_predictions.masked_fill(~action_mask, 0.0)
         
         # value estimate
         value = self.value_head(x)  # [batch, 1]
         
-        return logits, value
+        return logits, value, sum_predictions
     
     def get_action_and_value(
         self,
@@ -122,7 +146,7 @@ class CNNPolicy(nn.Module):
             logprob: [batch_size] log probabilities of sampled actions
             value: [batch_size, 1] value estimates
         """
-        logits, value = self.forward(obs, action_mask)
+        logits, value, sum_predictions = self.forward(obs, action_mask)
         
         # Sample action from valid actions only (matching test_sft.py behavior)
         # This ensures we never sample invalid actions, even with numerical precision issues

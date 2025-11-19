@@ -231,6 +231,7 @@ def train(
         epoch_legal_masses = []
         epoch_legal_predictions = []
         epoch_total_predictions = []
+        epoch_infos = []  # Track all info dicts for sum prediction metrics
         
         # Process in batches
         for batch_start in tqdm(range(0, len(all_data), batch_size), desc="Training"):
@@ -262,7 +263,7 @@ def train(
             # This prevents -log1p(-p) from becoming too large
             original_forward = policy.forward
             def clamped_forward(obs, masks):
-                logits, hidden = original_forward(obs, masks)
+                logits, value, sum_predictions = original_forward(obs, masks)
                 # Very aggressive clamping: [-5, 5] keeps softmax in safe range
                 # This ensures probabilities stay roughly in [0.0067, 0.9933]
                 # So -log1p(-p) stays roughly in [0.0067, 5.0] range (much safer)
@@ -270,7 +271,7 @@ def train(
                 # Replace any NaN/Inf with safe values
                 if torch.isnan(logits).any() or torch.isinf(logits).any():
                     logits = torch.nan_to_num(logits, nan=0.0, posinf=5.0, neginf=-5.0)
-                return logits, hidden
+                return logits, value, sum_predictions
             
             policy.forward = clamped_forward
             
@@ -292,6 +293,7 @@ def train(
                     topk_illegal_delta=1.0,  # Much reduced - this multiplies -log1p(-p) which can be large
                     legal_mass_bonus_zeta=0.1,  # Further reduced
                     use_set_based_losses=True,
+                    sum_prediction_loss_weight=0.1,  # weight for sum prediction MSE loss
                 )
                 
                 # Additional safety: check for inf/nan and clamp loss
@@ -350,6 +352,7 @@ def train(
             epoch_legal_masses.append(info.get('legal_mass', 0.0))
             epoch_legal_predictions.append(info.get('legal_predictions', 0))
             epoch_total_predictions.append(info.get('total_predictions', 0))
+            epoch_infos.append(info)  # Store full info dict for sum prediction metrics
         
         # Compute epoch metrics (filter out NaN values)
         valid_losses = [l for l in epoch_losses if not (np.isnan(l) or np.isinf(l))]
@@ -373,6 +376,10 @@ def train(
         legality_rate = (total_legal_predictions / total_predictions) if total_predictions > 0 else 0.0
         
         print(f"  Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}, Legality rate: {legality_rate:.4f}")
+        avg_sum_pred_loss = np.mean([info.get('sum_prediction_loss', 0.0) for info in epoch_infos if 'sum_prediction_loss' in info])
+        avg_sum_pred_mae = np.mean([info.get('sum_prediction_mae', 0.0) for info in epoch_infos if 'sum_prediction_mae' in info])
+        if avg_sum_pred_loss > 0:
+            print(f"  Sum prediction loss: {avg_sum_pred_loss:.4f}, Sum prediction MAE: {avg_sum_pred_mae:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
             print(f"  Negative accuracy: {avg_negative_accuracy:.4f}")
@@ -387,6 +394,8 @@ def train(
             "train/illegal_mass": avg_illegal_mass,
             "train/topk_illegal": avg_topk_illegal,
             "train/legal_mass": avg_legal_mass,
+            "train/sum_prediction_loss": avg_sum_pred_loss,
+            "train/sum_prediction_mae": avg_sum_pred_mae,
         }
         if total_negative > 0:
             log_dict["train/negative_accuracy"] = avg_negative_accuracy
@@ -442,15 +451,12 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(description="Finetune SFT policy on diverse_1k dataset")
-    parser.add_argument("--checkpoint", type=str, default="artifacts/policy_sft_epoch80.pt",
-                        help="Path to initial checkpoint")
-    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit_box_sft_finetuning",
-                        help="HuggingFace dataset name")
-    parser.add_argument("--dataset_split", type=str, default="train",
-                        help="Dataset split to use")
-    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--checkpoint", type=str, default="artifacts/policy_sft_epoch80.pt", help="Path to initial checkpoint")
+    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit_box_sft_finetuning", help="HuggingFace dataset name")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--checkpoint_interval", type=int, default=20, help="Save checkpoint every N epochs")
     args = parser.parse_args()

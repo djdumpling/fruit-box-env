@@ -191,7 +191,7 @@ def test_policy_with_all_masks(
             
             # Get top-3 anchor choices from policy
             with torch.no_grad():
-                logits, _ = policy(phase0_obs, phase0_mask)
+                logits, _, _ = policy(phase0_obs, phase0_mask)  # ignore value and sum_predictions
                 valid_indices = torch.nonzero(phase0_mask[0], as_tuple=False).squeeze(-1)
                 if valid_indices.numel() == 0:
                     break
@@ -206,7 +206,7 @@ def test_policy_with_all_masks(
             total_attempts = 0
             
             for anchor_attempt_idx, anchor_idx in enumerate(top_anchor_indices):
-                r1, c1 = flat_idx_to_anchor(anchor_idx)
+            r1, c1 = flat_idx_to_anchor(anchor_idx)
                 
                 # Save state before trying this anchor - recreate wrapped_env from current validation_env state
                 wrapped_env_save = TwoPhaseWrapper(
@@ -223,35 +223,35 @@ def test_policy_with_all_masks(
                     width = 17 - prev_c1
                     extent_idx_prev = (prev_r2 - prev_r1) * width + (prev_c2 - prev_c1)
                     wrapped_env_save.step(extent_idx_prev)  # Phase-1
-                
-                # step Phase-0
+            
+            # step Phase-0
                 obs_after_anchor, reward, terminated, truncated, info = wrapped_env_save.step(anchor_idx)
-                
-                # phase-1: use ALL geometrically valid extents (not just legal ones)
+            
+            # phase-1: use ALL geometrically valid extents (not just legal ones)
                 phase1_obs = obs_after_anchor.unsqueeze(0).to(device)
                 phase1_mask = wrapped_env_save.get_action_mask()  # ALL geometrically valid extents
-                
-                # pad to 170 if needed
-                if phase1_mask.shape[0] < 170:
-                    padded = torch.zeros(170, dtype=torch.bool)
-                    padded[:phase1_mask.shape[0]] = phase1_mask
-                    phase1_mask = padded
-                phase1_mask = phase1_mask.unsqueeze(0).to(device)
-                
-                if phase1_mask.sum() == 0:
+            
+            # pad to 170 if needed
+            if phase1_mask.shape[0] < 170:
+                padded = torch.zeros(170, dtype=torch.bool)
+                padded[:phase1_mask.shape[0]] = phase1_mask
+                phase1_mask = padded
+            phase1_mask = phase1_mask.unsqueeze(0).to(device)
+            
+            if phase1_mask.sum() == 0:
                     # No valid extents for this anchor, try next anchor
                     total_attempts += 1
                     continue
-                
+            
                 # Get top-3 extent choices from policy
-                with torch.no_grad():
-                    logits, _ = policy(phase1_obs, phase1_mask)
-                    valid_indices = torch.nonzero(phase1_mask[0], as_tuple=False).squeeze(-1)
-                    if valid_indices.numel() == 0:
+            with torch.no_grad():
+                    logits, _, _ = policy(phase1_obs, phase1_mask)  # ignore value and sum_predictions
+                valid_indices = torch.nonzero(phase1_mask[0], as_tuple=False).squeeze(-1)
+                if valid_indices.numel() == 0:
                         # No valid extents, try next anchor
                         total_attempts += 1
                         continue
-                    valid_logits = logits[0][valid_indices]
+                valid_logits = logits[0][valid_indices]
                     # Get top-3 choices (or fewer if less than 3 available)
                     k = min(3, valid_indices.numel())
                     topk_values, topk_indices_compact = torch.topk(valid_logits, k)
@@ -259,8 +259,8 @@ def test_policy_with_all_masks(
                 
                 # Try all 3 extent choices for this anchor
                 for extent_attempt_idx, extent_idx in enumerate(top_extent_indices):
-                    r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
-                    
+            r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
+            
                     # Use validation_env directly instead of creating a new one each time
                     # We need to check if the move is valid without modifying validation_env
                     # So we'll use a temporary copy only when needed
@@ -286,7 +286,7 @@ def test_policy_with_all_masks(
                     
                     # validate move
                     step_info = temp_validation_env.step(r1, c1, r2, c2)
-                    is_valid = step_info.valid
+            is_valid = step_info.valid
                     move_reward = step_info.reward if is_valid else 0
                     
                     total_attempts += 1
@@ -306,7 +306,7 @@ def test_policy_with_all_masks(
                                 }
                         
                         grid_moves += 1
-                        total_moves += 1
+            total_moves += 1
                         grid_valid_moves += 1
                         total_valid_moves += 1
                         grid_reward += move_reward
@@ -316,8 +316,8 @@ def test_policy_with_all_masks(
                         
                         # Update validation_env
                         validation_env.step(r1, c1, r2, c2)
-                        
-                        # Step Phase-1 in wrapped_env (this actually executes the move and updates state)
+            
+            # Step Phase-1 in wrapped_env (this actually executes the move and updates state)
                         obs, reward, terminated, truncated, info = wrapped_env_save.step(extent_idx)
                         wrapped_env = wrapped_env_save  # Use the successful state
                         

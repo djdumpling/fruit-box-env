@@ -567,7 +567,7 @@ def collect_rollouts(
                 full_mask[valid_indices] = True
                 
                 with torch.no_grad():
-                    logits, _ = frozen_policy(phase1_obs[i:i+1], full_mask.unsqueeze(0))
+                    logits, _, _ = frozen_policy(phase1_obs[i:i+1], full_mask.unsqueeze(0))  # ignore value and sum_predictions
                     # extract logits at valid indices (not necessarily at the beginning)
                     valid_logits = logits[0][valid_indices]
                     
@@ -963,7 +963,7 @@ def train(config: Config, use_wandb: bool = True):
         test_mask = test_mask.unsqueeze(0).to(device)
         
         with torch.no_grad():
-            test_logits, _ = policy(test_obs, test_mask)
+            test_logits, _, _ = policy(test_obs, test_mask)  # ignore value and sum_predictions
             test_action = test_logits.argmax(dim=1).item()
             print(f"  Sanity check: Phase-0 action selected: {test_action}")
         
@@ -980,7 +980,7 @@ def train(config: Config, use_wandb: bool = True):
         test_mask = test_mask.unsqueeze(0).to(device)
         
         with torch.no_grad():
-            test_logits, _ = policy(test_obs, test_mask)
+            test_logits, _, _ = policy(test_obs, test_mask)  # ignore value and sum_predictions
             test_action = test_logits.argmax(dim=1).item()
             print(f"  Sanity check: Phase-1 action selected: {test_action}")
         
@@ -1144,7 +1144,7 @@ def train(config: Config, use_wandb: bool = True):
                 # check KL constraint (compute KL divergence)
                 # we need to compute new logprobs to check KL
                 with torch.no_grad():
-                    logits, _ = policy(batch_obs, batch_masks)
+                    logits, _, _ = policy(batch_obs, batch_masks)  # ignore value and sum_predictions
                     new_logprobs_batch = []
                     for b in range(batch_obs.size(0)):
                         valid_mask = batch_masks[b]
