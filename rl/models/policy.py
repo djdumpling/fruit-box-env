@@ -118,16 +118,52 @@ class CNNPolicy(nn.Module):
             action_mask: [batch_size, action_dim] binary mask
         
         Returns:
-            action: [batch_size] sampled action indices
+            action: [batch_size] sampled action indices (in original space, not compact)
             logprob: [batch_size] log probabilities of sampled actions
             value: [batch_size, 1] value estimates
         """
         logits, value = self.forward(obs, action_mask)
         
-        # Sample action
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        logprob = dist.log_prob(action)
+        # Sample action from valid actions only (matching test_sft.py behavior)
+        # This ensures we never sample invalid actions, even with numerical precision issues
+        batch_size = obs.size(0)
+        actions = []
+        logprobs = []
         
-        return action, logprob, value
+        for b in range(batch_size):
+            if action_mask is not None:
+                mask = action_mask[b]  # [action_dim]
+                valid_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                if valid_indices.numel() == 0:
+                    # fallback: use argmax on full logits (shouldn't happen)
+                    action = logits[b].argmax().item()
+                    dist = torch.distributions.Categorical(logits=logits[b])
+                    logprob = dist.log_prob(torch.tensor(action, device=obs.device))
+                else:
+                    # ensure valid_indices is 1D
+                    if valid_indices.dim() == 0:
+                        valid_indices = valid_indices.unsqueeze(0)
+                    # extract logits at valid positions only
+                    valid_logits = logits[b][valid_indices]
+                    # sample from valid actions
+                    dist = torch.distributions.Categorical(logits=valid_logits)
+                    action_compact = dist.sample()
+                    # map back to original index space
+                    action = valid_indices[action_compact].item()
+                    # compute logprob using original logits (needed for PPO)
+                    dist_full = torch.distributions.Categorical(logits=logits[b])
+                    logprob = dist_full.log_prob(torch.tensor(action, device=obs.device))
+            else:
+                # no mask: sample from all actions
+                dist = torch.distributions.Categorical(logits=logits[b])
+                action = dist.sample().item()
+                logprob = dist.log_prob(torch.tensor(action, device=obs.device))
+            
+            actions.append(action)
+            logprobs.append(logprob)
+        
+        actions_tensor = torch.tensor(actions, device=obs.device, dtype=torch.long)
+        logprobs_tensor = torch.stack(logprobs)
+        
+        return actions_tensor, logprobs_tensor, value
 

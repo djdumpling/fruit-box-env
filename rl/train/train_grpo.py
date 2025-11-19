@@ -851,8 +851,68 @@ def train(config: Config, use_wandb: bool = True):
                 torch.nn.init.zeros_(param)
         
         print("Checkpoint loaded successfully! (Policy head from SFT, value head re-initialized)")
+        
+        # Verify checkpoint loaded correctly by checking a few weights
+        with torch.no_grad():
+            sample_weight = policy.phase0_head.weight[0, 0].item()
+            print(f"  Verification: phase0_head weight sample = {sample_weight:.6f}")
     else:
         print("Policy created (no checkpoint loaded)")
+    
+    # Set policy to eval mode for rollout collection (matches test_sft.py behavior)
+    # This ensures consistent behavior with how the checkpoint was evaluated
+    policy.eval()
+    print("Policy set to eval mode for rollout collection")
+    
+    # Quick sanity check: test policy on a single environment to verify it works
+    if config.load_checkpoint:
+        print("Running sanity check: testing loaded policy on a single environment...")
+        test_env = make_env(
+            config.seed + 999,  # use a different seed for test
+            curriculum_updates=config.curriculum_updates,
+            curriculum_legal_only=config.use_legal_only_masks
+        )
+        test_obs, _ = test_env.reset()
+        test_obs = test_obs.unsqueeze(0).to(device)
+        
+        # Test Phase-0
+        test_mask = test_env.get_action_mask()
+        if test_mask.shape[0] < 170:
+            padded = torch.zeros(170, dtype=torch.bool)
+            padded[:test_mask.shape[0]] = test_mask
+            test_mask = padded
+        test_mask = test_mask.unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            test_logits, _ = policy(test_obs, test_mask)
+            test_action = test_logits.argmax(dim=1).item()
+            print(f"  Sanity check: Phase-0 action selected: {test_action}")
+        
+        # Step Phase-0
+        test_obs, _, _, _, _ = test_env.step(test_action)
+        test_obs = test_obs.unsqueeze(0).to(device)
+        
+        # Test Phase-1
+        test_mask = test_env.get_action_mask()
+        if test_mask.shape[0] < 170:
+            padded = torch.zeros(170, dtype=torch.bool)
+            padded[:test_mask.shape[0]] = test_mask
+            test_mask = padded
+        test_mask = test_mask.unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            test_logits, _ = policy(test_obs, test_mask)
+            test_action = test_logits.argmax(dim=1).item()
+            print(f"  Sanity check: Phase-1 action selected: {test_action}")
+        
+        # Step Phase-1 and check validity
+        test_obs, test_reward, terminated, truncated, info = test_env.step(test_action)
+        is_valid = info.get("valid", True)
+        print(f"  Sanity check: Move valid: {is_valid}, Reward: {test_reward}")
+        if not is_valid:
+            print(f"  WARNING: Sanity check move was INVALID! This suggests a problem with the loaded policy.")
+        else:
+            print(f"  Sanity check passed: policy selected a valid move.")
     
     # create separate optimizers for Phase-0 and Phase-1
     # learning rates will be warmed up during training
@@ -933,6 +993,9 @@ def train(config: Config, use_wandb: bool = True):
             for reward, grid, r1, c1, r2, c2, turn in visualization_data:
                 total_reward += reward
                 visualize_action(grid, r1, c1, r2, c2, turn, reward, total_reward)
+        
+        # Set policy to train mode for updates (needed for dropout/batch norm if present)
+        policy.train()
         
         # get data
         phase0_data = buffer.get_phase0_data()
@@ -1272,6 +1335,9 @@ def train(config: Config, use_wandb: bool = True):
                 "rollout/total_moves": total_moves,
                 "rollout/legality_rate": valid_moves / max(total_moves, 1),
             }, step=update)
+        
+        # Set policy back to eval mode for next rollout collection
+        policy.eval()
         
         # clear buffer
         buffer.clear()
