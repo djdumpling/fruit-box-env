@@ -36,20 +36,34 @@ class Config:
     # training
     epochs: int = 200
     batch_size: int = 128  # increased for more stable gradients
-    lr: float = 2e-4  # increased learning rate for faster convergence
+    lr: float = 5e-5  # lowered learning rate for stability
     weight_decay: float = 1e-5
+    grad_clip_norm: float = 5.0  # gradient clipping threshold
     
     # negative examples (for learning legality) - reduced ratio since we use set-based losses
     include_negative_examples: bool = True
     negative_example_ratio: float = 2.0  # reduced from 10.0
-    negative_loss_weight: float = 2.0  # reduced from 5.0 - set-based losses are primary
+    negative_loss_weight: float = 2.0  # target weight after warmup
+    negative_loss_weight_start: float = 0.5  # initial weight before schedule
+    negative_example_ratio_start: float = 0.5  # initial ratio before staged ramp
+    negative_ratio_warmup_epochs: int = 15  # epochs to ramp ratio to target
     
     # set-based legality losses (penalize ALL illegal actions simultaneously)
-    illegal_mass_alpha: float = 2.0  # linear penalty on sum of illegal probabilities
-    illegal_mass_beta: float = 3.0  # squared penalty on sum of illegal probabilities (stronger gradients)
+    illegal_mass_alpha: float = 2.0  # target linear penalty on sum of illegal probabilities
+    illegal_mass_alpha_start: float = 0.5  # initial alpha before schedule
+    illegal_mass_beta: float = 3.0  # target squared penalty on sum of illegal probabilities (stronger gradients)
+    illegal_mass_beta_start: float = 1.0  # initial beta before schedule
     topk_illegal_k: int = 10  # number of top illegal actions to penalize
-    topk_illegal_delta: float = 5.0  # weight for top-K illegal loss
+    topk_illegal_delta: float = 5.0  # target weight for top-K illegal loss
+    topk_illegal_delta_start: float = 1.0  # initial delta before schedule
     legal_mass_bonus_zeta: float = 0.5  # bonus for high probability on legal actions
+    loss_schedule_delay_epochs: int = 3  # epochs to wait before ramping loss weights
+    loss_schedule_warmup_epochs: int = 15  # epochs over which to ramp to final weights
+    
+    # auxiliary head warmup
+    sum_prediction_loss_weight: float = 0.1  # target weight for sum prediction head
+    sum_prediction_loss_start: float = 0.02  # initial weight before warmup
+    sum_prediction_loss_warmup_epochs: int = 10  # epochs to reach full weight
     
     # curriculum learning
     curriculum_legal_only_epochs: int = 1  # start with legal-only masks for stability
@@ -59,6 +73,12 @@ class Config:
     extent_curriculum_epochs: int = 20  # epochs to focus on small extents
     min_extent_size: int = 2  # minimum (dr, dc) size to include early (e.g., max(dr, dc) >= 2)
     max_extent_size_early: int = 4  # maximum extent size in early curriculum (e.g., max(dr, dc) <= 4)
+    extent_curriculum_final_size: int = 16  # target max extent size once curriculum finishes
+    
+    # instrumentation / debugging
+    instrument_batches: bool = True  # log batch-level stats for early epochs
+    instrument_batches_epochs: int = 5  # number of epochs to capture per-batch stats
+    instrument_batches_every: int = 10  # log every N batches
     
     # reward-weighted sampling and context-aware loss
     use_reward_weighted_sampling: bool = True  # sample examples with probability proportional to reward^alpha
@@ -1220,12 +1240,102 @@ def train(config: Config):
         else:
             random.shuffle(all_positive_data)
         
+        # schedule legality and curriculum settings before epoch loop
+        def interp(start: float, end: float, progress: float) -> float:
+            return start + (end - start) * progress
+        
+        if config.extent_curriculum_epochs <= 0:
+            extent_curriculum_progress = 1.0
+        else:
+            extent_curriculum_progress = min(
+                1.0,
+                (epoch + 1) / max(config.extent_curriculum_epochs, 1),
+            )
+        current_max_extent_size = int(round(interp(
+            config.max_extent_size_early,
+            config.extent_curriculum_final_size,
+            extent_curriculum_progress,
+        )))
+        current_max_extent_size = max(current_max_extent_size, config.max_extent_size_early)
+        
+        if config.negative_ratio_warmup_epochs <= 0:
+            negative_ratio_progress = 1.0
+        else:
+            negative_ratio_progress = min(
+                1.0,
+                (epoch + 1) / max(config.negative_ratio_warmup_epochs, 1),
+            )
+        current_negative_ratio = interp(
+            config.negative_example_ratio_start,
+            config.negative_example_ratio,
+            negative_ratio_progress,
+        )
+        
+        if config.loss_schedule_warmup_epochs <= 0:
+            loss_schedule_progress = 1.0
+        else:
+            if epoch < config.loss_schedule_delay_epochs:
+                loss_schedule_progress = 0.0
+            else:
+                warmed_up_epochs = epoch - config.loss_schedule_delay_epochs + 1
+                loss_schedule_progress = min(
+                    1.0,
+                    warmed_up_epochs / max(config.loss_schedule_warmup_epochs, 1),
+                )
+        
+        current_negative_loss_weight = interp(
+            config.negative_loss_weight_start,
+            config.negative_loss_weight,
+            loss_schedule_progress,
+        )
+        current_illegal_mass_alpha = interp(
+            config.illegal_mass_alpha_start,
+            config.illegal_mass_alpha,
+            loss_schedule_progress,
+        )
+        current_illegal_mass_beta = interp(
+            config.illegal_mass_beta_start,
+            config.illegal_mass_beta,
+            loss_schedule_progress,
+        )
+        current_topk_illegal_delta = interp(
+            config.topk_illegal_delta_start,
+            config.topk_illegal_delta,
+            loss_schedule_progress,
+        )
+        
+        if config.sum_prediction_loss_warmup_epochs <= 0:
+            sum_loss_progress = 1.0
+        else:
+            sum_loss_progress = min(
+                1.0,
+                (epoch + 1) / max(config.sum_prediction_loss_warmup_epochs, 1),
+            )
+        current_sum_pred_loss_weight = interp(
+            config.sum_prediction_loss_start,
+            config.sum_prediction_loss_weight,
+            sum_loss_progress,
+        )
+        
         print(f"  Training on {len(all_positive_data)} positive examples ({len(phase0_data)} Phase-0 + {len(phase1_data)} Phase-1)")
         if config.include_negative_examples:
-            print(f"  Generating negatives on-the-fly with ratio {config.negative_example_ratio}:1")
+            print(f"  Generating negatives on-the-fly with ratio {current_negative_ratio:.2f}:1 "
+                  f"(weight={current_negative_loss_weight:.2f}, schedule progress={loss_schedule_progress:.2f})")
+        if config.extent_curriculum_epochs > 0:
+            print(f"  Extent curriculum progress={extent_curriculum_progress:.2f} "
+                  f"(max extent size={current_max_extent_size})")
+        if not use_legal_only_masks:
+            print(f"  Set-based weights this epoch → alpha={current_illegal_mass_alpha:.2f}, "
+                  f"beta={current_illegal_mass_beta:.2f}, topk_delta={current_topk_illegal_delta:.2f}")
+        print(f"  Sum-head loss weight={current_sum_pred_loss_weight:.3f} (progress={sum_loss_progress:.2f})")
         
         policy.train()
         epoch_losses = []
+        instrument_epoch = (
+            config.instrument_batches and 
+            epoch < config.instrument_batches_epochs
+        )
+        instrumentation_samples = []
         batch_data_for_logging = None
         batch_obs_for_logging = None
         batch_actions_for_logging = None
@@ -1233,7 +1343,7 @@ def train(config: Config):
         
         # calculate batch composition: if ratio=1:1, batch_size=128, then ~64 positives, ~64 negatives
         if config.include_negative_examples:
-            ratio = config.negative_example_ratio
+            ratio = max(current_negative_ratio, 0.0)
             positive_per_batch = max(1, int(config.batch_size / (ratio + 1)))
             negative_per_batch = config.batch_size - positive_per_batch
         else:
@@ -1251,13 +1361,15 @@ def train(config: Config):
             if not candidate_positives:
                 continue  # skip empty slices (can occur due to sampling)
             
-            # apply extent-size curriculum filtering
+            # apply extent-size curriculum filtering (gradual expansion)
             batch_positives = []
-            if epoch < config.extent_curriculum_epochs:
-                # Filter Phase-1 examples by extent size
+            curriculum_active = (
+                config.extent_curriculum_epochs > 0 and
+                current_max_extent_size < config.extent_curriculum_final_size
+            )
+            if curriculum_active:
                 for pos_example in candidate_positives:
                     if pos_example.get('phase') == 1:
-                        # Phase-1: check extent size
                         r1 = pos_example['r1']
                         c1 = pos_example['c1']
                         action_idx = pos_example['action'].item()
@@ -1265,18 +1377,14 @@ def train(config: Config):
                         dr = r2 - r1
                         dc = c2 - c1
                         max_size = max(dr, dc)
-                        
-                        # Include if within size bounds
-                        if config.min_extent_size <= max_size <= config.max_extent_size_early:
+                        if config.min_extent_size <= max_size <= current_max_extent_size:
                             batch_positives.append(pos_example)
                             extent_sizes.append(max_size)
                     else:
-                        # Phase-0: always include
                         batch_positives.append(pos_example)
                 
-                # If filtering removed too many, pad with more candidates
                 next_idx = start + len(batch_positives)
-                max_search = min(len(all_positive_data), start + positive_per_batch * 3)  # safety limit
+                max_search = min(len(all_positive_data), start + positive_per_batch * 3)
                 while len(batch_positives) < positive_per_batch and next_idx < max_search:
                     if next_idx < len(all_positive_data):
                         candidate = all_positive_data[next_idx]
@@ -1288,7 +1396,7 @@ def train(config: Config):
                             dr = r2 - r1
                             dc = c2 - c1
                             max_size = max(dr, dc)
-                            if config.min_extent_size <= max_size <= config.max_extent_size_early:
+                            if config.min_extent_size <= max_size <= current_max_extent_size:
                                 batch_positives.append(candidate)
                                 extent_sizes.append(max_size)
                         else:
@@ -1297,7 +1405,6 @@ def train(config: Config):
                     if len(batch_positives) >= positive_per_batch:
                         break
             else:
-                # No filtering: include all examples and track extent sizes
                 batch_positives = candidate_positives
                 for pos_example in batch_positives:
                     if pos_example.get('phase') == 1:
@@ -1314,7 +1421,7 @@ def train(config: Config):
             batch_negatives = []
             if config.include_negative_examples:
                 for pos_example in batch_positives:
-                    negs, neg_stats = generate_negatives_for_positive(pos_example, config.negative_example_ratio)
+                    negs, neg_stats = generate_negatives_for_positive(pos_example, current_negative_ratio)
                     # track hard negative statistics
                     if neg_stats['used_hard_negatives']:
                         hard_negative_count += 1
@@ -1394,12 +1501,12 @@ def train(config: Config):
             use_set_based = not use_legal_only_masks
             loss, info = compute_sft_loss(
                 policy, batch_obs, batch_actions, batch_masks, batch_is_positive,
-                negative_loss_weight=config.negative_loss_weight,
+                negative_loss_weight=current_negative_loss_weight,
                 legal_actions_sets=legal_actions_sets,
-                illegal_mass_alpha=config.illegal_mass_alpha,
-                illegal_mass_beta=config.illegal_mass_beta,
+                illegal_mass_alpha=current_illegal_mass_alpha,
+                illegal_mass_beta=current_illegal_mass_beta,
                 topk_illegal_k=config.topk_illegal_k,
-                topk_illegal_delta=config.topk_illegal_delta,
+                topk_illegal_delta=current_topk_illegal_delta,
                 legal_mass_bonus_zeta=config.legal_mass_bonus_zeta,
                 use_set_based_losses=use_set_based,
                 rewards=batch_rewards,
@@ -1408,19 +1515,41 @@ def train(config: Config):
                 use_context_aware_reward_weighting=config.use_context_aware_reward_weighting,
                 context_aware_early_threshold=config.context_aware_early_threshold,
                 context_aware_trajectory_threshold=config.context_aware_trajectory_threshold,
-                sum_prediction_loss_weight=0.1,  # weight for sum prediction MSE loss
+                sum_prediction_loss_weight=current_sum_pred_loss_weight,
             )
+            batch_loss_value = float(loss.detach().item())
             
             # backward pass
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip_norm)
             optimizer.step()
             
             # Add gradient norm to info
             info['grad_norm'] = grad_norm.item()
             
             epoch_losses.append(info)
+            
+            # Batch-level instrumentation for early epochs to diagnose exploding loss/gradients
+            should_instrument = (
+                instrument_epoch and 
+                (batch_idx % max(config.instrument_batches_every, 1) == 0)
+            )
+            if should_instrument:
+                positives_in_batch = int(batch_is_positive.sum().item()) if batch_is_positive is not None else len(batch_data)
+                negatives_in_batch = len(batch_data) - positives_in_batch
+                instrumentation_samples.append({
+                    "epoch": epoch + 1,
+                    "batch": batch_idx,
+                    "loss": batch_loss_value,
+                    "grad_norm": grad_norm.item(),
+                    "phase0_legal": info.get('phase0_legal_accuracy', 0.0),
+                    "phase1_legal": info.get('phase1_legal_accuracy', 0.0),
+                    "negatives": negatives_in_batch,
+                    "positives": positives_in_batch,
+                    "using_set_losses": use_set_based,
+                    "neg_ratio": current_negative_ratio,
+                })
             
             # save first batch for logging example moves
             if batch_idx == 0:
@@ -1456,9 +1585,19 @@ def train(config: Config):
         avg_phase0_legal_accuracy = np.mean([info.get('phase0_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase0_count', 0) > 0] or [0.0])
         avg_phase1_legal_accuracy = np.mean([info.get('phase1_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase1_count', 0) > 0] or [0.0])
         
-        # Entropy and gradient norm
-        avg_entropy = np.mean([info.get('entropy', 0.0) for info in epoch_losses])
-        avg_grad_norm = np.mean([info.get('grad_norm', 0.0) for info in epoch_losses])
+        # Entropy and gradient norm (guard against NaN/Inf so Wandb keeps logging)
+        avg_entropy = float(np.nan_to_num(
+            np.mean([info.get('entropy', 0.0) for info in epoch_losses]),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ))
+        avg_grad_norm = float(np.nan_to_num(
+            np.mean([info.get('grad_norm', 0.0) for info in epoch_losses]),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ))
         
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Legality rate={avg_legality_rate:.4f}")
         print(f"  Phase-0: Legal accuracy={avg_phase0_legal_accuracy:.4f} ({total_phase0} examples)")
@@ -1487,6 +1626,19 @@ def train(config: Config):
                 num_examples=5,
             )
         
+        # Print instrumentation summary to help pinpoint instability onset
+        if instrumentation_samples:
+            print("  Instrumentation samples (early epochs):")
+            for sample in instrumentation_samples[:10]:
+                print(
+                    f"    Batch {sample['batch']:03d} | "
+                    f"loss={sample['loss']:.2f} | grad_norm={sample['grad_norm']:.2f} | "
+                    f"phase0_legal={sample['phase0_legal']:.2f} | phase1_legal={sample['phase1_legal']:.2f} | "
+                    f"positives={sample['positives']} neg={sample['negatives']} | "
+                    f"neg_ratio={sample['neg_ratio']:.2f} | "
+                    f"{'set-loss' if sample['using_set_losses'] else 'curriculum-only'}"
+                )
+        
         log_dict = {
             "epoch": epoch + 1,
             "train/loss": avg_loss,
@@ -1499,6 +1651,14 @@ def train(config: Config):
             # Training dynamics
             "train/entropy": avg_entropy,
             "train/grad_norm": avg_grad_norm,
+            "train/loss_schedule_progress": loss_schedule_progress,
+            "train/negative_loss_weight_active": current_negative_loss_weight,
+            "train/illegal_mass_alpha_active": current_illegal_mass_alpha,
+            "train/illegal_mass_beta_active": current_illegal_mass_beta,
+            "train/topk_illegal_delta_active": current_topk_illegal_delta,
+            "train/negative_ratio_active": current_negative_ratio,
+            "train/sum_loss_weight_active": current_sum_pred_loss_weight,
+            "train/sum_loss_progress": sum_loss_progress,
         }
         if total_negative > 0:
             log_dict["train/negative_accuracy"] = avg_negative_accuracy

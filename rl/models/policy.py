@@ -110,6 +110,8 @@ class CNNPolicy(nn.Module):
             phase1_logits,
             phase0_logits
         )  # [batch, action_dim]
+        # Clamp logits to avoid saturation that leads to NaNs in downstream losses
+        logits = torch.clamp(logits, min=-8.0, max=8.0)
         
         # For Phase-0, set sum predictions to zero (not used)
         sum_predictions = torch.where(
