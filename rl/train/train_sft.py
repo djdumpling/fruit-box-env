@@ -1226,7 +1226,6 @@ def train(config: Config):
         
         policy.train()
         epoch_losses = []
-        epoch_accuracies = []
         batch_data_for_logging = None
         batch_obs_for_logging = None
         batch_actions_for_logging = None
@@ -1422,7 +1421,6 @@ def train(config: Config):
             info['grad_norm'] = grad_norm.item()
             
             epoch_losses.append(info)
-            epoch_accuracies.append(info['accuracy'])
             
             # save first batch for logging example moves
             if batch_idx == 0:
