@@ -1566,6 +1566,7 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint_interval", type=int, default=20)
     parser.add_argument("--init_checkpoint", type=str, default=None, help="Optional initial checkpoint to warm start")
+    parser.add_argument("--negative_example_ratio", type=float, default=2.0, help="Ratio of negative examples per positive")
     args = parser.parse_args()
     
     config = Config(
@@ -1580,6 +1581,7 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_interval=args.checkpoint_interval,
         init_checkpoint=args.init_checkpoint,
+        negative_example_ratio=args.negative_example_ratio,
     )
     
     train(config)
