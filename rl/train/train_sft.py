@@ -41,7 +41,7 @@ class Config:
     
     # negative examples (for learning legality) - reduced ratio since we use set-based losses
     include_negative_examples: bool = True
-    negative_example_ratio: float = 1.0  # reduced from 10.0 - set-based losses handle most of the work
+    negative_example_ratio: float = 2.0  # reduced from 10.0
     negative_loss_weight: float = 2.0  # reduced from 5.0 - set-based losses are primary
     
     # set-based legality losses (penalize ALL illegal actions simultaneously)
@@ -801,12 +801,21 @@ def compute_sft_loss(
     # compute loss for each sample
     losses = []
     set_based_losses = []  # illegal mass, top-k, legal bonus
-    correct = 0
-    total = 0
+    total = 0  # positive example count
     negative_correct = 0
     negative_total = 0
     legal_prediction_count = 0
     total_prediction_count = 0
+    
+    # Phase-specific legal accuracy tracking (PRIMARY metric)
+    # We track whether predicted actions are legal, not whether they match expert exactly
+    phase0_total = 0
+    phase0_legal_correct = 0  # predicted anchor has at least one legal extent
+    phase1_total = 0
+    phase1_legal_correct = 0  # predicted extent is legal (sum=10)
+    
+    # Entropy tracking
+    entropies = []
     
     # metrics for set-based losses
     illegal_mass_sum = 0.0
@@ -843,6 +852,13 @@ def compute_sft_loss(
         
         # compute probabilities over valid actions
         probs = F.softmax(valid_logits, dim=0)  # [valid_count]
+        
+        # compute entropy (for exploration/confidence tracking)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8))
+        entropies.append(entropy.item())
+        
+        # determine phase
+        is_phase1 = phases[b] > 0.5
         
         legal_actions_set = None
         if legal_actions_sets is not None and b < len(legal_actions_sets):
@@ -970,19 +986,43 @@ def compute_sft_loss(
             
         losses.append(loss)
         
-        # compute accuracy
+        # Get predicted action
         pred_action_compact = valid_logits.argmax().item()
         pred_action_original = valid_indices[pred_action_compact].item()
         
+        # Track negative example accuracy (for negative examples, we want model to NOT pick the illegal action)
         if is_neg:
             negative_total += 1
             if pred_action_original != action:
                 negative_correct += 1
         else:
             total += 1
-            if pred_action_original == action:
-                correct += 1
+            # For positive examples, we only track legal accuracy (not exact match)
+            # because there are multiple valid moves per grid state
+            
+            # Phase-specific legal accuracy tracking (PRIMARY metric)
+            if is_phase1:
+                # Phase-1: extent selection
+                phase1_total += 1
+                # Legal accuracy: check if predicted extent is legal (sum=10)
+                if legal_actions_set is not None:
+                    if pred_action_original in legal_actions_set:
+                        phase1_legal_correct += 1
+                else:
+                    # During curriculum, all exposed actions are legal
+                    phase1_legal_correct += 1
+            else:
+                # Phase-0: anchor selection
+                phase0_total += 1
+                # Legal accuracy: check if predicted anchor has at least one legal extent
+                if legal_actions_set is not None:
+                    if pred_action_original in legal_actions_set:
+                        phase0_legal_correct += 1
+                else:
+                    # During curriculum, all exposed actions are legal
+                    phase0_legal_correct += 1
 
+        # Track overall legal prediction count
         total_prediction_count += 1
         if legal_actions_set is not None:
             if pred_action_original in legal_actions_set:
@@ -1005,7 +1045,9 @@ def compute_sft_loss(
         # Add sum prediction loss
         loss = loss + sum_prediction_loss_weight * sum_pred_loss
     
-        accuracy = correct / total if total > 0 else 0.0
+    # Note: We don't track exact match accuracy for positive examples
+    # because there are multiple valid moves per grid state
+    # Legal accuracy is the meaningful metric
     negative_accuracy = negative_correct / negative_total if negative_total > 0 else 0.0
     
     # compute average metrics
@@ -1013,10 +1055,16 @@ def compute_sft_loss(
     avg_topk_illegal = topk_illegal_sum / set_based_count if set_based_count > 0 else 0.0
     avg_legal_mass = legal_mass_sum / set_based_count if set_based_count > 0 else 0.0
     
+    # Phase-specific legal accuracies (PRIMARY metrics)
+    phase0_legal_accuracy = phase0_legal_correct / phase0_total if phase0_total > 0 else 0.0
+    phase1_legal_accuracy = phase1_legal_correct / phase1_total if phase1_total > 0 else 0.0
+    
+    # Average entropy
+    avg_entropy = np.mean(entropies) if entropies else 0.0
+    
     info = {
         'loss': loss.item(),
-        'accuracy': accuracy,
-        'negative_accuracy': negative_accuracy,
+        'negative_accuracy': negative_accuracy,  # For negative examples: did model avoid the illegal action?
         'positive_count': total,
         'negative_count': negative_total,
         'illegal_mass': avg_illegal_mass,
@@ -1026,6 +1074,13 @@ def compute_sft_loss(
         'total_predictions': total_prediction_count,
         'sum_prediction_loss': sum_pred_loss.item() if isinstance(sum_pred_loss, torch.Tensor) else sum_pred_loss,
         'sum_prediction_mae': mean_sum_error,
+        # Phase-specific legal accuracies (PRIMARY metrics)
+        'phase0_legal_accuracy': phase0_legal_accuracy,  # Does predicted anchor have valid extents?
+        'phase0_count': phase0_total,
+        'phase1_legal_accuracy': phase1_legal_accuracy,  # Does predicted extent sum to 10?
+        'phase1_count': phase1_total,
+        # Entropy
+        'entropy': avg_entropy,
     }
     
     return loss, info
@@ -1360,8 +1415,11 @@ def train(config: Config):
             # backward pass
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
+            
+            # Add gradient norm to info
+            info['grad_norm'] = grad_norm.item()
             
             epoch_losses.append(info)
             epoch_accuracies.append(info['accuracy'])
@@ -1375,7 +1433,6 @@ def train(config: Config):
         
         # logging
         avg_loss = np.mean([d['loss'] for d in epoch_losses])
-        avg_accuracy = np.mean([d['accuracy'] for d in epoch_losses])
         avg_negative_accuracy = np.mean([d.get('negative_accuracy', 0.0) for d in epoch_losses])
         total_legal_predictions = sum(d.get('legal_predictions', 0) for d in epoch_losses)
         total_predictions = sum(d.get('total_predictions', 0) for d in epoch_losses)
@@ -1395,7 +1452,20 @@ def train(config: Config):
         avg_extent_size = np.mean(extent_sizes) if extent_sizes else 0.0
         max_extent_size = max(extent_sizes) if extent_sizes else 0
         
-        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}, Legality rate={avg_legality_rate:.4f}")
+        # Phase-specific legal accuracy metrics (PRIMARY)
+        total_phase0 = sum([info.get('phase0_count', 0) for info in epoch_losses])
+        total_phase1 = sum([info.get('phase1_count', 0) for info in epoch_losses])
+        avg_phase0_legal_accuracy = np.mean([info.get('phase0_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase0_count', 0) > 0] or [0.0])
+        avg_phase1_legal_accuracy = np.mean([info.get('phase1_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase1_count', 0) > 0] or [0.0])
+        
+        # Entropy and gradient norm
+        avg_entropy = np.mean([info.get('entropy', 0.0) for info in epoch_losses])
+        avg_grad_norm = np.mean([info.get('grad_norm', 0.0) for info in epoch_losses])
+        
+        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Legality rate={avg_legality_rate:.4f}")
+        print(f"  Phase-0: Legal accuracy={avg_phase0_legal_accuracy:.4f} ({total_phase0} examples)")
+        print(f"  Phase-1: Legal accuracy={avg_phase1_legal_accuracy:.4f} ({total_phase1} examples)")
+        print(f"  Entropy: {avg_entropy:.4f}, Grad norm: {avg_grad_norm:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
             print(f"  Negative accuracy (avoiding illegal actions): {avg_negative_accuracy:.4f}")
@@ -1422,8 +1492,15 @@ def train(config: Config):
         log_dict = {
             "epoch": epoch + 1,
             "train/loss": avg_loss,
-            "train/accuracy": avg_accuracy,
-            "train/legality_rate": avg_legality_rate,
+            "train/legality_rate": avg_legality_rate,  # Overall legal action rate
+            # Phase-specific legal accuracies (PRIMARY metrics)
+            "train/phase0_legal_accuracy": avg_phase0_legal_accuracy,  # Valid anchor selection
+            "train/phase1_legal_accuracy": avg_phase1_legal_accuracy,  # Valid extent selection
+            "train/phase0_count": total_phase0,
+            "train/phase1_count": total_phase1,
+            # Training dynamics
+            "train/entropy": avg_entropy,
+            "train/grad_norm": avg_grad_norm,
         }
         if total_negative > 0:
             log_dict["train/negative_accuracy"] = avg_negative_accuracy
