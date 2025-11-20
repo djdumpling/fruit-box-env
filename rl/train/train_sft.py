@@ -46,34 +46,47 @@ class Config:
     negative_loss_weight: float = 2.0  # target weight after warmup
     negative_loss_weight_start: float = 0.5  # initial weight before schedule
     negative_example_ratio_start: float = 0.5  # initial ratio before staged ramp
-    negative_ratio_warmup_epochs: int = 15  # epochs to ramp ratio to target
+    negative_ratio_warmup_epochs: int = 12  # epochs to ramp ratio to target (finish around epoch 22, just before curriculum ends)
     
     # set-based legality losses (penalize ALL illegal actions simultaneously)
     illegal_mass_alpha: float = 2.0  # target linear penalty on sum of illegal probabilities
-    illegal_mass_alpha_start: float = 0.5  # initial alpha before schedule
+    illegal_mass_alpha_start: float = 0.2  # reduced initial alpha for gentler start
     illegal_mass_beta: float = 3.0  # target squared penalty on sum of illegal probabilities (stronger gradients)
-    illegal_mass_beta_start: float = 1.0  # initial beta before schedule
+    illegal_mass_beta_start: float = 0.5  # reduced initial beta for gentler start
     topk_illegal_k: int = 10  # number of top illegal actions to penalize
     topk_illegal_delta: float = 5.0  # target weight for top-K illegal loss
-    topk_illegal_delta_start: float = 1.0  # initial delta before schedule
+    topk_illegal_delta_start: float = 0.5  # reduced initial delta for gentler start
     legal_mass_bonus_zeta: float = 0.5  # bonus for high probability on legal actions
-    loss_schedule_delay_epochs: int = 3  # epochs to wait before ramping loss weights
-    loss_schedule_warmup_epochs: int = 15  # epochs over which to ramp to final weights
+    loss_schedule_delay_epochs: int = 5  # delay before ramping loss weights
+    loss_schedule_warmup_epochs: int = 15  # warmup period (finish by epoch 20, before curriculum ends)
+    
+    # phase-specific loss weights (Phase-1 has harder task with more illegal extents)
+    phase0_loss_weight: float = 1.0  # standard weight for Phase-0 (anchor selection)
+    phase1_loss_weight: float = 1.5  # increased weight for Phase-1 (extent selection)
+    phase1_set_based_multiplier: float = 1.5  # multiplier for set-based losses in Phase-1
     
     # auxiliary head warmup
     sum_prediction_loss_weight: float = 0.1  # target weight for sum prediction head
     sum_prediction_loss_start: float = 0.02  # initial weight before warmup
-    sum_prediction_loss_warmup_epochs: int = 10  # epochs to reach full weight
+    sum_prediction_loss_warmup_epochs: int = 15  # warmup to delay sum prediction loss (finish at epoch 15, during curriculum)
     
     # curriculum learning
-    curriculum_legal_only_epochs: int = 1  # start with legal-only masks for stability
+    curriculum_legal_only_epochs: int = 10  # shortened legal-only period - gives model foundation before illegal actions
     use_curriculum: bool = True  # enable curriculum learning
     
+    # turn-aware curriculum (filter by turn number and adjust extent limits)
+    turn_based_curriculum: bool = True  # enable turn-based filtering and extent limits
+    turn_threshold: int = 25  # turn < 25 = early game (more small extents), turn >= 25 = late game (more large extents)
+    turn_curriculum_epochs: int = 20  # epochs to gradually include late-game examples (finish around when extent curriculum ends)
+    turn_early_max_extent_size: int = 6  # max extent size for early-game examples (turn < 25)
+    turn_late_max_extent_size: int = 16  # max extent size for late-game examples (turn >= 25)
+    
     # extent-size curriculum learning (focus on small extents early)
-    extent_curriculum_epochs: int = 20  # epochs to focus on small extents
+    extent_curriculum_epochs: int = 25  # shortened curriculum for faster progression
     min_extent_size: int = 2  # minimum (dr, dc) size to include early (e.g., max(dr, dc) >= 2)
     max_extent_size_early: int = 4  # maximum extent size in early curriculum (e.g., max(dr, dc) <= 4)
     extent_curriculum_final_size: int = 16  # target max extent size once curriculum finishes
+    extent_curriculum_expansion_rate: float = 0.5  # per-epoch expansion rate for max_extent_size (slower expansion)
     
     # instrumentation / debugging
     instrument_batches: bool = True  # log batch-level stats for early epochs
@@ -745,6 +758,9 @@ def compute_sft_loss(
     context_aware_early_threshold: float = 0.5,
     context_aware_trajectory_threshold: int = 20,
     sum_prediction_loss_weight: float = 0.1,  # weight for MSE loss on sum predictions
+    phase0_loss_weight: float = 1.0,  # weight multiplier for Phase-0 losses
+    phase1_loss_weight: float = 1.5,  # weight multiplier for Phase-1 losses
+    phase1_set_based_multiplier: float = 1.5,  # multiplier for set-based losses in Phase-1
 ) -> Tuple[torch.Tensor, Dict]:
     """Compute SFT loss with set-based legality losses
     
@@ -842,6 +858,11 @@ def compute_sft_loss(
     topk_illegal_sum = 0.0
     legal_mass_sum = 0.0
     set_based_count = 0
+    # Phase-specific metrics
+    phase0_losses = []
+    phase1_losses = []
+    phase1_illegal_mass_sum = 0.0
+    phase1_set_based_count = 0
     
     for b in range(obs.size(0)):
         mask = masks[b]  # [170]
@@ -904,9 +925,17 @@ def compute_sft_loss(
                 illegal_mass = illegal_probs.sum()
                 illegal_mass_sum += illegal_mass.item()
                 
+                # Track Phase-1 illegal mass separately
+                if is_phase1:
+                    phase1_illegal_mass_sum += illegal_mass.item()
+                    phase1_set_based_count += 1
+                
+                # Apply phase-specific multiplier for set-based losses (Phase-1 needs stronger signal)
+                set_multiplier = phase1_set_based_multiplier if is_phase1 else 1.0
+                
                 # linear + squared penalty
                 illegal_mass_loss = (illegal_mass_alpha * illegal_mass + 
-                                    illegal_mass_beta * (illegal_mass ** 2))
+                                    illegal_mass_beta * (illegal_mass ** 2)) * set_multiplier
                 set_based_losses.append(illegal_mass_loss)
                 
                 # top-K illegal loss: penalize top-K illegal actions by probability
@@ -919,7 +948,7 @@ def compute_sft_loss(
                     epsilon = 1e-8
                     topk_illegal_probs_clamped = torch.clamp(topk_illegal_probs, min=epsilon, max=1.0 - epsilon)
                     topk_log_penalties = -torch.log1p(-topk_illegal_probs_clamped)  # -log(1 - p)
-                    topk_loss = topk_illegal_delta * topk_log_penalties.sum()
+                    topk_loss = topk_illegal_delta * topk_log_penalties.sum() * set_multiplier
                     set_based_losses.append(topk_loss)
             
             # legal mass bonus: reward high probability on legal actions
@@ -929,12 +958,16 @@ def compute_sft_loss(
                 legal_mass_sum += legal_mass.item()
                 # bonus = -zeta * log(legal_mass + epsilon) to encourage high legal mass
                 epsilon = 1e-8
-                legal_bonus = -legal_mass_bonus_zeta * torch.log(legal_mass + epsilon)
+                set_multiplier = phase1_set_based_multiplier if is_phase1 else 1.0
+                legal_bonus = -legal_mass_bonus_zeta * torch.log(legal_mass + epsilon) * set_multiplier
                 set_based_losses.append(legal_bonus)
             
             set_based_count += 1
         
         # compute standard loss (positive/negative example loss)
+        # Apply phase-specific loss weights
+        phase_weight = phase1_loss_weight if is_phase1 else phase0_loss_weight
+        
         if is_neg:
             # for negative examples: penalize high probability on the illegal action
             log_probs = F.log_softmax(valid_logits, dim=0)
@@ -943,7 +976,7 @@ def compute_sft_loss(
             illegal_prob = torch.clamp(illegal_prob, min=1e-8, max=1.0 - 1e-8)
             log_penalty = -torch.log1p(-illegal_prob)
             squared_penalty = illegal_prob ** 2
-            loss = (log_penalty + squared_penalty) * negative_loss_weight
+            loss = (log_penalty + squared_penalty) * negative_loss_weight * phase_weight
         else:
             # for positive examples: standard cross-entropy
             base_loss = F.cross_entropy(valid_logits.unsqueeze(0), torch.tensor([action_compact], device=obs.device))
@@ -1000,11 +1033,16 @@ def compute_sft_loss(
                     reward_weight = reward / (max_reward_in_batch + 1e-8)
                     reward_weight = max(0.1, min(2.0, reward_weight))
                 
-                loss = base_loss * reward_weight
+                loss = base_loss * reward_weight * phase_weight
             else:
-                loss = base_loss
+                loss = base_loss * phase_weight
             
         losses.append(loss)
+        # Track phase-specific losses
+        if is_phase1:
+            phase1_losses.append(loss.item())
+        else:
+            phase0_losses.append(loss.item())
         
         # Get predicted action
         pred_action_compact = valid_logits.argmax().item()
@@ -1079,6 +1117,13 @@ def compute_sft_loss(
     phase0_legal_accuracy = phase0_legal_correct / phase0_total if phase0_total > 0 else 0.0
     phase1_legal_accuracy = phase1_legal_correct / phase1_total if phase1_total > 0 else 0.0
     
+    # Phase-specific illegal mass (for Phase-1 debugging)
+    phase1_illegal_mass = phase1_illegal_mass_sum / phase1_set_based_count if phase1_set_based_count > 0 else 0.0
+    
+    # Phase-specific average losses
+    avg_phase0_loss = np.mean(phase0_losses) if phase0_losses else 0.0
+    avg_phase1_loss = np.mean(phase1_losses) if phase1_losses else 0.0
+    
     # Average entropy
     avg_entropy = np.mean(entropies) if entropies else 0.0
     
@@ -1099,6 +1144,10 @@ def compute_sft_loss(
         'phase0_count': phase0_total,
         'phase1_legal_accuracy': phase1_legal_accuracy,  # Does predicted extent sum to 10?
         'phase1_count': phase1_total,
+        # Phase-specific losses and metrics
+        'phase0_loss': avg_phase0_loss,
+        'phase1_loss': avg_phase1_loss,
+        'phase1_illegal_mass': phase1_illegal_mass,  # Probability mass on illegal extents in Phase-1
         # Entropy
         'entropy': avg_entropy,
     }
@@ -1195,6 +1244,29 @@ def train(config: Config):
         # combine Phase-0 and Phase-1 positive examples only
         all_positive_data = phase0_data + phase1_data
         
+        # apply turn-aware curriculum filtering
+        if config.turn_based_curriculum:
+            # Gradually include late-game examples (turn >= 25)
+            if epoch < config.turn_curriculum_epochs:
+                # Compute progress: 0.0 at epoch 0, 1.0 at turn_curriculum_epochs
+                turn_curriculum_progress = min(1.0, epoch / max(config.turn_curriculum_epochs, 1))
+                # Gradually include late-game examples
+                filtered_data = []
+                for example in all_positive_data:
+                    step_num = example.get('step_num', 0)
+                    if step_num < config.turn_threshold:
+                        # Early-game examples: always include
+                        filtered_data.append(example)
+                    else:
+                        # Late-game examples: include based on progress
+                        if random.random() < turn_curriculum_progress:
+                            filtered_data.append(example)
+                all_positive_data = filtered_data
+                if epoch == 0 or epoch % 5 == 0:
+                    early_count = sum(1 for e in all_positive_data if e.get('step_num', 0) < config.turn_threshold)
+                    late_count = len(all_positive_data) - early_count
+                    print(f"  Turn-aware curriculum: {early_count} early-game (turn<{config.turn_threshold}), {late_count} late-game examples")
+        
         # apply reward-weighted sampling if enabled
         if config.use_reward_weighted_sampling:
             # compute sampling weights: reward^alpha, but balance with trajectory position
@@ -1258,18 +1330,26 @@ def train(config: Config):
         )))
         current_max_extent_size = max(current_max_extent_size, config.max_extent_size_early)
         
-        if config.negative_ratio_warmup_epochs <= 0:
-            negative_ratio_progress = 1.0
+        # Gradual illegal exposure: start at 0 during legal-only period, then ramp up
+        if use_legal_only_masks:
+            # During legal-only period: no negative examples
+            current_negative_ratio = 0.0
         else:
-            negative_ratio_progress = min(
-                1.0,
-                (epoch + 1) / max(config.negative_ratio_warmup_epochs, 1),
+            # After legal-only period: gradually increase negative ratio
+            # Compute progress from end of legal-only period
+            epochs_since_legal_only = max(0, epoch - config.curriculum_legal_only_epochs + 1)
+            if config.negative_ratio_warmup_epochs <= 0:
+                negative_ratio_progress = 1.0
+            else:
+                negative_ratio_progress = min(
+                    1.0,
+                    epochs_since_legal_only / max(config.negative_ratio_warmup_epochs, 1),
+                )
+            current_negative_ratio = interp(
+                config.negative_example_ratio_start,
+                config.negative_example_ratio,
+                negative_ratio_progress,
             )
-        current_negative_ratio = interp(
-            config.negative_example_ratio_start,
-            config.negative_example_ratio,
-            negative_ratio_progress,
-        )
         
         if config.loss_schedule_warmup_epochs <= 0:
             loss_schedule_progress = 1.0
@@ -1361,7 +1441,7 @@ def train(config: Config):
             if not candidate_positives:
                 continue  # skip empty slices (can occur due to sampling)
             
-            # apply extent-size curriculum filtering (gradual expansion)
+            # apply extent-size curriculum filtering (gradual expansion with turn-aware limits)
             batch_positives = []
             curriculum_active = (
                 config.extent_curriculum_epochs > 0 and
@@ -1377,7 +1457,20 @@ def train(config: Config):
                         dr = r2 - r1
                         dc = c2 - c1
                         max_size = max(dr, dc)
-                        if config.min_extent_size <= max_size <= current_max_extent_size:
+                        
+                        # Turn-aware extent limits: early-game (turn < 25) uses stricter limits
+                        step_num = pos_example.get('step_num', 0)
+                        if config.turn_based_curriculum and step_num < config.turn_threshold:
+                            # Early-game: use stricter limit
+                            effective_max_size = min(current_max_extent_size, config.turn_early_max_extent_size)
+                        elif config.turn_based_curriculum:
+                            # Late-game: use more lenient limit
+                            effective_max_size = min(current_max_extent_size, config.turn_late_max_extent_size)
+                        else:
+                            # No turn-aware curriculum: use standard limit
+                            effective_max_size = current_max_extent_size
+                        
+                        if config.min_extent_size <= max_size <= effective_max_size:
                             batch_positives.append(pos_example)
                             extent_sizes.append(max_size)
                     else:
@@ -1396,7 +1489,17 @@ def train(config: Config):
                             dr = r2 - r1
                             dc = c2 - c1
                             max_size = max(dr, dc)
-                            if config.min_extent_size <= max_size <= current_max_extent_size:
+                            
+                            # Turn-aware extent limits (same logic as above)
+                            step_num = candidate.get('step_num', 0)
+                            if config.turn_based_curriculum and step_num < config.turn_threshold:
+                                effective_max_size = min(current_max_extent_size, config.turn_early_max_extent_size)
+                            elif config.turn_based_curriculum:
+                                effective_max_size = min(current_max_extent_size, config.turn_late_max_extent_size)
+                            else:
+                                effective_max_size = current_max_extent_size
+                            
+                            if config.min_extent_size <= max_size <= effective_max_size:
                                 batch_positives.append(candidate)
                                 extent_sizes.append(max_size)
                         else:
@@ -1516,17 +1619,23 @@ def train(config: Config):
                 context_aware_early_threshold=config.context_aware_early_threshold,
                 context_aware_trajectory_threshold=config.context_aware_trajectory_threshold,
                 sum_prediction_loss_weight=current_sum_pred_loss_weight,
+                phase0_loss_weight=config.phase0_loss_weight,
+                phase1_loss_weight=config.phase1_loss_weight,
+                phase1_set_based_multiplier=config.phase1_set_based_multiplier,
             )
             batch_loss_value = float(loss.detach().item())
             
             # backward pass
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip_norm)
+            # clip_grad_norm_ returns the pre-clipped norm, but we want to log the post-clipped norm
+            pre_clipped_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip_norm)
+            # Compute actual post-clipped norm to verify clipping worked
+            post_clipped_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'))
             optimizer.step()
             
-            # Add gradient norm to info
-            info['grad_norm'] = grad_norm.item()
+            # Add gradient norm to info (post-clipped norm, should be <= grad_clip_norm)
+            info['grad_norm'] = post_clipped_norm.item()
             
             epoch_losses.append(info)
             
@@ -1542,7 +1651,7 @@ def train(config: Config):
                     "epoch": epoch + 1,
                     "batch": batch_idx,
                     "loss": batch_loss_value,
-                    "grad_norm": grad_norm.item(),
+                    "grad_norm": post_clipped_norm.item(),
                     "phase0_legal": info.get('phase0_legal_accuracy', 0.0),
                     "phase1_legal": info.get('phase1_legal_accuracy', 0.0),
                     "negatives": negatives_in_batch,
@@ -1576,6 +1685,7 @@ def train(config: Config):
         hard_negative_ratio = hard_negative_count / max(total_negative_count, 1)
         
         # extent size distribution
+        # Note: avg_extent_size is max(dr, dc), not the number of non-zero cells within the extent
         avg_extent_size = np.mean(extent_sizes) if extent_sizes else 0.0
         max_extent_size = max(extent_sizes) if extent_sizes else 0
         
@@ -1584,6 +1694,11 @@ def train(config: Config):
         total_phase1 = sum([info.get('phase1_count', 0) for info in epoch_losses])
         avg_phase0_legal_accuracy = np.mean([info.get('phase0_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase0_count', 0) > 0] or [0.0])
         avg_phase1_legal_accuracy = np.mean([info.get('phase1_legal_accuracy', 0.0) for info in epoch_losses if info.get('phase1_count', 0) > 0] or [0.0])
+        
+        # Phase-specific losses and metrics
+        avg_phase0_loss = np.mean([info.get('phase0_loss', 0.0) for info in epoch_losses if info.get('phase0_loss', 0.0) > 0] or [0.0])
+        avg_phase1_loss = np.mean([info.get('phase1_loss', 0.0) for info in epoch_losses if info.get('phase1_loss', 0.0) > 0] or [0.0])
+        avg_phase1_illegal_mass = np.mean([info.get('phase1_illegal_mass', 0.0) for info in epoch_losses if info.get('phase1_illegal_mass', 0.0) > 0] or [0.0])
         
         # Entropy and gradient norm (guard against NaN/Inf so Wandb keeps logging)
         avg_entropy = float(np.nan_to_num(
@@ -1600,8 +1715,8 @@ def train(config: Config):
         ))
         
         print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Legality rate={avg_legality_rate:.4f}")
-        print(f"  Phase-0: Legal accuracy={avg_phase0_legal_accuracy:.4f} ({total_phase0} examples)")
-        print(f"  Phase-1: Legal accuracy={avg_phase1_legal_accuracy:.4f} ({total_phase1} examples)")
+        print(f"  Phase-0: Legal accuracy={avg_phase0_legal_accuracy:.4f}, Loss={avg_phase0_loss:.4f} ({total_phase0} examples)")
+        print(f"  Phase-1: Legal accuracy={avg_phase1_legal_accuracy:.4f}, Loss={avg_phase1_loss:.4f}, Illegal mass={avg_phase1_illegal_mass:.4f} ({total_phase1} examples)")
         print(f"  Entropy: {avg_entropy:.4f}, Grad norm: {avg_grad_norm:.4f}")
         if total_negative > 0:
             print(f"  Positive examples: {total_positive}, Negative examples: {total_negative}")
@@ -1648,6 +1763,10 @@ def train(config: Config):
             "train/phase1_legal_accuracy": avg_phase1_legal_accuracy,  # Valid extent selection
             "train/phase0_count": total_phase0,
             "train/phase1_count": total_phase1,
+            # Phase-specific losses and metrics
+            "train/phase0_loss": avg_phase0_loss,
+            "train/phase1_loss": avg_phase1_loss,
+            "train/phase1_illegal_mass": avg_phase1_illegal_mass,  # Probability mass on illegal extents in Phase-1
             # Training dynamics
             "train/entropy": avg_entropy,
             "train/grad_norm": avg_grad_norm,
