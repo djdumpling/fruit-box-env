@@ -11,6 +11,8 @@ import tempfile
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List
 from tqdm import tqdm
 import wandb
 
@@ -21,6 +23,156 @@ from rl.train.sft_dataset import load_and_process_dataset
 from rl.train.sft_negatives import generate_negatives_for_positive
 from rl.train.sft_loss import compute_sft_loss
 from rl.train.sft_logging import log_example_moves
+from fruit_box import Sum10Env
+
+
+def pretrain_sum_prediction(
+    config: Config,
+    policy: CNNPolicy,
+    phase1_data: List[Dict],
+    device: torch.device,
+):
+    """Pre-train sum prediction head to learn 'sum must equal 10' rule.
+    
+    This phase is completely separate from main training epochs.
+    Freezes policy heads and trains only feature extractor + sum_prediction_head.
+    Uses Phase-1 examples (both legal and illegal) to learn the sum rule.
+    """
+    print("\n" + "="*60)
+    print("SUM PREDICTION PRE-TRAINING PHASE")
+    print("="*60)
+    print(f"Pre-training for {config.sum_pretrain_epochs} epochs (separate from main training)")
+    
+    # Freeze policy heads: phase0_head, phase1_head, anchor_embedding, value_head
+    # Trainable: feature_extractor (conv layers, fc, ln), sum_prediction_head
+    for name, param in policy.named_parameters():
+        if 'phase0_head' in name or 'phase1_head' in name or 'anchor_embedding' in name or 'value_head' in name:
+            param.requires_grad = False
+    else:
+            param.requires_grad = True
+    
+    # Create optimizer only for trainable parameters
+    trainable_params = [p for p in policy.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(
+        trainable_params,
+        lr=config.sum_pretrain_lr,
+        weight_decay=config.weight_decay
+    )
+    
+    print(f"Frozen: phase0_head, phase1_head, anchor_embedding, value_head")
+    print(f"Trainable: feature_extractor, sum_prediction_head")
+    print(f"Learning rate: {config.sum_pretrain_lr:.2e}")
+    print(f"Using {len(phase1_data)} Phase-1 examples")
+    
+    temp_env = Sum10Env()
+    
+    # Pre-training loop
+    for epoch in range(config.sum_pretrain_epochs):
+        print(f"\nPre-training Epoch {epoch + 1}/{config.sum_pretrain_epochs}")
+        
+        # Shuffle Phase-1 data
+        shuffled_data = phase1_data.copy()
+        random.shuffle(shuffled_data)
+        
+        # Generate negatives on-the-fly with 1:1 ratio
+        all_examples = []
+        for pos_example in shuffled_data:
+            all_examples.append(pos_example)
+            # Generate 1 negative per positive
+            negs, _ = generate_negatives_for_positive(pos_example, negative_example_ratio=1.0)
+            all_examples.extend(negs)
+        
+        random.shuffle(all_examples)
+        
+        epoch_losses = []
+        epoch_maes = []
+        
+        # Training batches
+        for batch_idx, start in enumerate(tqdm(
+            range(0, len(all_examples), config.sum_pretrain_batch_size),
+            desc="Pre-training"
+        )):
+            batch_data = all_examples[start:start + config.sum_pretrain_batch_size]
+            if not batch_data:
+                continue
+            
+            # Stack observations and masks
+            batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
+            batch_masks = torch.stack([d['mask'] for d in batch_data]).to(device)
+            
+            # Forward pass
+            policy.train()
+            logits, value, sum_predictions = policy(batch_obs, batch_masks)
+            
+            # Compute sum prediction loss only
+            batch_losses = []
+            batch_maes = []
+            grids = (batch_obs[:, 0, :, :] * 9.0).cpu().numpy().astype(np.uint8)
+            phases = batch_obs[:, 3, 0, 0].cpu().numpy()
+            
+            for b in range(batch_obs.size(0)):
+                if phases[b] > 0.5:  # Phase-1 only
+                    # Extract anchor position
+                    anchor_mask = batch_obs[b, 2, :, :].cpu().numpy()
+                    anchor_pos = np.argwhere(anchor_mask > 0.5)
+                    if len(anchor_pos) == 0:
+                        continue
+                    r1, c1 = int(anchor_pos[0][0]), int(anchor_pos[0][1])
+                    
+                    # Get grid and compute actual sums
+                    grid = grids[b]
+                    temp_env.reset(grid=grid.copy())
+                    mask = batch_masks[b].cpu().numpy()
+                    valid_indices = np.where(mask)[0]
+                    
+                    actual_sums = np.zeros(170, dtype=np.float32)
+                    for extent_idx in valid_indices:
+                        r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
+                        if 0 <= r2 < 10 and 0 <= c2 < 17 and r1 <= r2 and c1 <= c2:
+                            actual_sum = temp_env.box_sum(r1, c1, r2, c2)
+                            actual_sums[extent_idx] = float(actual_sum)
+                    
+                    # Compute MSE loss
+                    if len(valid_indices) > 0:
+                        valid_sum_predictions = sum_predictions[b][valid_indices]
+                        valid_actual_sums = torch.from_numpy(actual_sums[valid_indices]).to(device)
+                        mse_loss = F.mse_loss(valid_sum_predictions, valid_actual_sums)
+                        batch_losses.append(mse_loss)
+                        mae = torch.mean(torch.abs(valid_sum_predictions - valid_actual_sums))
+                        batch_maes.append(mae.item())
+            
+            if batch_losses:
+                loss = torch.stack(batch_losses).mean()
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip_norm)
+                optimizer.step()
+                
+                epoch_losses.append(loss.item())
+                epoch_maes.extend(batch_maes)
+        
+        # Logging
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        avg_mae = np.mean(epoch_maes) if epoch_maes else 0.0
+        
+        print(f"  Loss: {avg_loss:.4f}, MAE: {avg_mae:.4f}")
+        
+        # Log to wandb
+        wandb.log({
+            "pretrain/epoch": epoch + 1,
+            "pretrain/loss": avg_loss,
+            "pretrain/mae": avg_mae,
+        })
+    
+    # Unfreeze all parameters for main training
+    for param in policy.parameters():
+        param.requires_grad = True
+    
+    print("\n" + "="*60)
+    print("PRE-TRAINING COMPLETE - Starting main training")
+    print("="*60 + "\n")
 
 
 def train(config: Config):
@@ -112,14 +264,18 @@ def train(config: Config):
     ])
     print(f"Optimizer: Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e} (multiplier={config.phase1_lr_multiplier})")
     
-    # training loop
+    # Sum prediction pre-training (completely separate from main training epochs)
+    if config.sum_pretrain_epochs > 0:
+        pretrain_sum_prediction(config, policy, phase1_data, device)
+    
+    # Main training loop (epochs are independent of pre-training)
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
         # curriculum learning: use legal-only masks for first N epochs
         # Phase-0 and Phase-1 have separate legal-only periods
         use_legal_only_masks_phase0 = (config.use_curriculum and 
-                                      epoch < config.curriculum_legal_only_epochs)
+                               epoch < config.curriculum_legal_only_epochs)
         use_legal_only_masks_phase1 = (config.use_curriculum and 
                                       epoch < config.curriculum_phase1_legal_only_epochs)
         
@@ -205,13 +361,21 @@ def train(config: Config):
         def interp(start: float, end: float, progress: float) -> float:
             return start + (end - start) * progress
         
+        # Extent curriculum: delay expansion for first N epochs
         if config.extent_curriculum_epochs <= 0:
             extent_curriculum_progress = 1.0
         else:
-            extent_curriculum_progress = min(
-                1.0,
-                (epoch + 1) / max(config.extent_curriculum_epochs, 1),
-            )
+            if epoch < config.extent_curriculum_delay_epochs:
+                # Keep at early size for first N epochs
+                extent_curriculum_progress = 0.0
+            else:
+                # Start expansion after delay
+                effective_epoch = epoch - config.extent_curriculum_delay_epochs
+                effective_curriculum_epochs = config.extent_curriculum_epochs - config.extent_curriculum_delay_epochs
+                extent_curriculum_progress = min(
+                    1.0,
+                    effective_epoch / max(effective_curriculum_epochs, 1),
+                )
         current_max_extent_size = int(round(interp(
             config.max_extent_size_early,
             config.extent_curriculum_final_size,
@@ -219,26 +383,44 @@ def train(config: Config):
         )))
         current_max_extent_size = max(current_max_extent_size, config.max_extent_size_early)
         
-        # Gradual illegal exposure: start at 0 during legal-only period, then ramp up
-        # Use Phase-1 legal-only period as the reference (longer, so more conservative)
-        if use_legal_only_masks_phase1:
-            # During legal-only period: no negative examples
+        # Gradual illegal exposure: start earlier to align with mask transition
+        # Begin negative introduction when mask transition starts (epoch 15)
+        transition_start = config.phase1_mask_transition_start_epoch
+        if epoch < transition_start:
+            # Before transition: no negative examples
             current_negative_ratio = 0.0
         else:
-            # After legal-only period: gradually increase negative ratio
-            # Compute progress from end of Phase-1 legal-only period (longer, more conservative)
-            epochs_since_legal_only = max(0, epoch - config.curriculum_phase1_legal_only_epochs + 1)
-            if config.negative_ratio_warmup_epochs <= 0:
+            # During and after transition: gradually increase negative ratio
+            # Compute progress from transition start
+            epochs_since_transition = max(0, epoch - transition_start + 1)
+            # Use longer warmup period to align with mask transition
+            total_warmup = config.phase1_mask_transition_epochs + config.negative_ratio_warmup_epochs
+            if total_warmup <= 0:
                 negative_ratio_progress = 1.0
             else:
                 negative_ratio_progress = min(
                     1.0,
-                    epochs_since_legal_only / max(config.negative_ratio_warmup_epochs, 1),
+                    epochs_since_transition / max(total_warmup, 1),
                 )
             current_negative_ratio = interp(
                 config.negative_example_ratio_start,
                 config.negative_example_ratio,
                 negative_ratio_progress,
+            )
+        
+        # Calculate gradual Phase-1 mask transition progress
+        # For Phase-1: gradually transition from legal-only to all-geometric
+        if epoch < config.phase1_mask_transition_start_epoch:
+            phase1_mask_transition_progress = 0.0  # Fully legal-only
+        elif epoch >= config.curriculum_phase1_legal_only_epochs:
+            phase1_mask_transition_progress = 1.0  # Fully all-geometric
+        else:
+            # Gradual transition between start and end
+            transition_epochs = config.curriculum_phase1_legal_only_epochs - config.phase1_mask_transition_start_epoch
+            epochs_into_transition = epoch - config.phase1_mask_transition_start_epoch + 1
+            phase1_mask_transition_progress = min(
+                1.0,
+                epochs_into_transition / max(transition_epochs, 1),
             )
         
         if config.loss_schedule_warmup_epochs <= 0:
@@ -298,6 +480,8 @@ def train(config: Config):
             print(f"  Set-based weights this epoch → alpha={current_illegal_mass_alpha:.2f}, "
                   f"beta={current_illegal_mass_beta:.2f}, topk_delta={current_topk_illegal_delta:.2f}")
         print(f"  Sum-head loss weight={current_sum_pred_loss_weight:.3f} (progress={sum_loss_progress:.2f})")
+        if phase1_mask_transition_progress > 0.0 and phase1_mask_transition_progress < 1.0:
+            print(f"  Phase-1 mask transition: {phase1_mask_transition_progress:.2%} (gradual transition active)")
         
         policy.train()
         epoch_losses = []
@@ -451,20 +635,58 @@ def train(config: Config):
             updated_masks = []
             for i, d in enumerate(batch_data):
                 phase = d.get('phase', 0)
-                use_legal_only = (use_legal_only_masks_phase0 if phase == 0 else use_legal_only_masks_phase1)
                 
-                if use_legal_only:
-                    # curriculum phase: use legal-only masks (reconstruct from legal sets)
-                    mask = torch.zeros(170, dtype=torch.bool)
-                    legal_set = legal_actions_sets[i]
-                    for legal_idx in legal_set:
-                        if legal_idx < 170 and legal_idx > 0:  # Skip idx=0 (dr=0, dc=0)
-                            mask[legal_idx] = True
-                    updated_masks.append(mask)
+                if phase == 0:
+                    # Phase-0: use standard logic
+                    use_legal_only = use_legal_only_masks_phase0
+                    if use_legal_only:
+                        # curriculum phase: use legal-only masks
+                        mask = torch.zeros(170, dtype=torch.bool)
+                        legal_set = legal_actions_sets[i]
+                        for legal_idx in legal_set:
+                            if legal_idx < 170 and legal_idx > 0:
+                                mask[legal_idx] = True
+                        updated_masks.append(mask)
+                    else:
+                        # full phase: use all-geometric masks
+                        mask = d["mask"] if d["mask"].shape[0] == 170 else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
+                        updated_masks.append(mask)
                 else:
-                    # full phase: use all-geometric masks (already in batch_data)
-                    mask = d["mask"] if d["mask"].shape[0] == 170 else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
-                    updated_masks.append(mask)
+                    # Phase-1: use gradual transition
+                    if phase1_mask_transition_progress < 1.0:
+                        # Gradual transition: mix legal and illegal actions
+                        mask = torch.zeros(170, dtype=torch.bool)
+                        legal_set = legal_actions_sets[i]
+                        
+                        # Always include all legal actions
+                        for legal_idx in legal_set:
+                            if legal_idx < 170 and legal_idx > 0:
+                                mask[legal_idx] = True
+                        
+                        # Gradually include illegal actions based on transition progress
+                        if phase1_mask_transition_progress > 0.0:
+                            # Get all geometrically valid extents (from original mask)
+                            original_mask = d["mask"] if d["mask"].shape[0] == 170 else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
+                            illegal_indices = []
+                            for idx in range(170):
+                                if original_mask[idx] and idx not in legal_set and idx > 0:
+                                    illegal_indices.append(idx)
+                            
+                            # Sample illegal actions to include based on transition progress
+                            num_illegal_to_include = int(len(illegal_indices) * phase1_mask_transition_progress)
+                            if num_illegal_to_include > 0 and illegal_indices:
+                                sampled_illegal = random.sample(
+                                    illegal_indices,
+                                    min(num_illegal_to_include, len(illegal_indices))
+                                )
+                                for illegal_idx in sampled_illegal:
+                                    mask[illegal_idx] = True
+                        
+                        updated_masks.append(mask)
+                    else:
+                        # Fully transitioned: use all-geometric masks
+                        mask = d["mask"] if d["mask"].shape[0] == 170 else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
+                        updated_masks.append(mask)
             
             batch_masks = torch.stack(updated_masks).to(device)
             
@@ -646,7 +868,7 @@ def train(config: Config):
                     f"positives={sample['positives']} neg={sample['negatives']} | "
                     f"neg_ratio={sample['neg_ratio']:.2f} | "
                     f"{'set-loss' if sample['using_set_losses'] else 'curriculum-only'}"
-                )
+            )
         
         log_dict = {
             "epoch": epoch + 1,

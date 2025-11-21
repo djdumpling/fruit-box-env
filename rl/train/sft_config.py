@@ -49,6 +49,11 @@ class Config:
     sum_prediction_loss_start: float = 0.02  # initial weight before warmup
     sum_prediction_loss_warmup_epochs: int = 15  # warmup to delay sum prediction loss (finish at epoch 15, during curriculum)
     
+    # sum prediction pre-training (runs before main training, separate epochs)
+    sum_pretrain_epochs: int = 10  # Number of epochs for sum prediction pre-training
+    sum_pretrain_lr: float = 3e-5  # Learning rate for pre-training (can use same as main training)
+    sum_pretrain_batch_size: int = 128  # Batch size for pre-training
+    
     # curriculum learning
     curriculum_legal_only_epochs: int = 15  # extended legal-only period (was 10) to give model stronger foundation before illegal actions
     curriculum_phase1_legal_only_epochs: int = 25  # Phase-1 specific legal-only period (10 epochs longer than Phase-0) to give Phase-1 more foundation
@@ -63,10 +68,15 @@ class Config:
     
     # extent-size curriculum learning (focus on small extents early)
     extent_curriculum_epochs: int = 30  # extended curriculum (was 25) for smoother transition and better stability
+    extent_curriculum_delay_epochs: int = 10  # Keep max_extent_size at 4 for first N epochs before starting expansion
     min_extent_size: int = 2  # minimum (dr, dc) size to include early (e.g., max(dr, dc) >= 2)
     max_extent_size_early: int = 4  # maximum extent size in early curriculum (e.g., max(dr, dc) <= 4)
     extent_curriculum_final_size: int = 16  # target max extent size once curriculum finishes
     extent_curriculum_expansion_rate: float = 0.5  # per-epoch expansion rate for max_extent_size (slower expansion)
+    
+    # Phase-1 mask transition (gradual transition from legal-only to all-geometric)
+    phase1_mask_transition_epochs: int = 10  # Number of epochs to gradually transition mask
+    phase1_mask_transition_start_epoch: int = 15  # Start gradual transition at this epoch (before legal-only ends at 25)
     
     # instrumentation / debugging
     instrument_batches: bool = True  # log batch-level stats for early epochs
