@@ -16,7 +16,8 @@ class Config:
     batch_size: int = 128  # increased for more stable gradients
     lr: float = 3e-5  # further lowered learning rate for stability (was 5e-5)
     phase1_lr_multiplier: float = 1.5  # Phase-1 learning rate multiplier (Phase-1 gets lr * 1.5 = 4.5e-5)
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4  # increased from 1e-5 to 1e-4 for stronger regularization to prevent overfitting
+    dropout: float = 0.1  # dropout probability for regularization (applied after LayerNorm in policy network)
     grad_clip_norm: float = 7.0  # increased gradient clipping threshold (was 5.0) to allow larger gradients
     
     # negative examples (for learning legality) - reduced ratio since we use set-based losses

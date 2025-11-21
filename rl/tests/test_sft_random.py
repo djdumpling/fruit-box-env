@@ -268,7 +268,7 @@ def main():
     parser.add_argument("--collect_examples", action="store_true", help="Emit corrective examples")
     parser.add_argument("--output_examples", type=str, default=None, help="Path for corrective JSONL")
     parser.add_argument("--verbose", action="store_true", help="Print per-grid stats")
-    parser.add_argument("--visualize", action="store_true", default=True, help="Show grid and action visualization (default: True)")
+    parser.add_argument("--visualize", action="store_true", help="Show grid and action visualization (default: False, shows summary stats)")
     args = parser.parse_args()
 
     # Generate unique random grids

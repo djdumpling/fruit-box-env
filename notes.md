@@ -4,3 +4,5 @@
 
 4. currently, the sum-prediction (170-dim ??) is concatenated with features (256-dim). also gradient interference.
 5. need to do some pre-training (teach the policy the rules, train only the prediction head and freeze other)
+
+6. (non-pretraining run) is overfitting, need to add validation monitoring/increase regularization/data augmentation

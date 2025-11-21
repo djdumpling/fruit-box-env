@@ -10,7 +10,7 @@ class CNNPolicy(nn.Module):
     
     Architecture:
     - Conv2d(4, 32, 3x3) → GroupNorm → GELU → Conv2d(32, 64, 3x3) → GroupNorm → GELU
-    - Flatten → Linear(64*8*15, 256) → GELU → LayerNorm
+    - Flatten → Linear(64*8*15, 256) → GELU → LayerNorm → Dropout (for regularization)
     - Phase-0 head: Linear(256, action_dim) - anchor selection
     - Phase-1 head: Linear(256 + 64, action_dim) - extent selection with anchor embedding
     - Anchor embedding: Embedding(170, 64) - conditions Phase-1 on selected anchor (increased from 32 to 64 dims)
@@ -20,16 +20,21 @@ class CNNPolicy(nn.Module):
     Key design: Sum predictions are decoupled from Phase-1 policy head to avoid gradient
     interference. Phase-1 uses anchor embedding instead to explicitly model anchor-extent
     dependency.
+    
+    Regularization: Dropout is applied after LayerNorm to prevent overfitting and improve
+    generalization. Dropout is only active during training (automatically handled by model.train()/eval()).
     """
     
     def __init__(
         self,
         obs_shape: Tuple[int, int, int] = (4, 10, 17),
         action_dim: int = 170,
+        dropout: float = 0.1,  # dropout probability for regularization
     ):
         super().__init__()
         self.obs_shape = obs_shape
         self.action_dim = action_dim
+        self.dropout = dropout
         
         # convolutional layers
         # input: (4, 10, 17)
@@ -56,6 +61,8 @@ class CNNPolicy(nn.Module):
         # fully connected layers
         self.fc = nn.Linear(self.flattened_size, 256)
         self.ln = nn.LayerNorm(256)
+        # Dropout after LayerNorm for regularization (prevents overfitting)
+        self.dropout_layer = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         
         # separate policy heads for Phase-0 (anchor selection) and Phase-1 (extent selection)
         self.phase0_head = nn.Linear(256, action_dim)  # anchor selection
@@ -98,6 +105,7 @@ class CNNPolicy(nn.Module):
         x = x.view(x.size(0), -1)  # [batch, 7680]
         x = F.gelu(self.fc(x))  # [batch, 256]
         x = self.ln(x)  # [batch, 256] - LayerNorm before heads
+        x = self.dropout_layer(x)  # [batch, 256] - Dropout for regularization (only active during training)
         
         # determine phase from observation (channel 3, any pixel will do)
         # phase_mask is 0.0 for Phase-0, 1.0 for Phase-1

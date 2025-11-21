@@ -1,4 +1,10 @@
-"""SFT training script - main entry point."""
+"""SFT training script - main entry point.
+
+Note: Sum prediction head pre-training should be done separately using:
+    python rl/train/pretrain_sum_prediction.py
+    
+Then load the pre-trained checkpoint using --init_checkpoint when running this script.
+"""
 import sys
 from pathlib import Path
 # add project root to path for imports (go up 2 levels from rl/train/train_sft.py)
@@ -23,156 +29,6 @@ from rl.train.sft_dataset import load_and_process_dataset
 from rl.train.sft_negatives import generate_negatives_for_positive
 from rl.train.sft_loss import compute_sft_loss
 from rl.train.sft_logging import log_example_moves
-from fruit_box import Sum10Env
-
-
-def pretrain_sum_prediction(
-    config: Config,
-    policy: CNNPolicy,
-    phase1_data: List[Dict],
-    device: torch.device,
-):
-    """Pre-train sum prediction head to learn 'sum must equal 10' rule.
-    
-    This phase is completely separate from main training epochs.
-    Freezes policy heads and trains only feature extractor + sum_prediction_head.
-    Uses Phase-1 examples (both legal and illegal) to learn the sum rule.
-    """
-    print("\n" + "="*60)
-    print("SUM PREDICTION PRE-TRAINING PHASE")
-    print("="*60)
-    print(f"Pre-training for {config.sum_pretrain_epochs} epochs (separate from main training)")
-    
-    # Freeze policy heads: phase0_head, phase1_head, anchor_embedding, value_head
-    # Trainable: feature_extractor (conv layers, fc, ln), sum_prediction_head
-    for name, param in policy.named_parameters():
-        if 'phase0_head' in name or 'phase1_head' in name or 'anchor_embedding' in name or 'value_head' in name:
-            param.requires_grad = False
-    else:
-            param.requires_grad = True
-    
-    # Create optimizer only for trainable parameters
-    trainable_params = [p for p in policy.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(
-        trainable_params,
-        lr=config.sum_pretrain_lr,
-        weight_decay=config.weight_decay
-    )
-    
-    print(f"Frozen: phase0_head, phase1_head, anchor_embedding, value_head")
-    print(f"Trainable: feature_extractor, sum_prediction_head")
-    print(f"Learning rate: {config.sum_pretrain_lr:.2e}")
-    print(f"Using {len(phase1_data)} Phase-1 examples")
-    
-    temp_env = Sum10Env()
-    
-    # Pre-training loop
-    for epoch in range(config.sum_pretrain_epochs):
-        print(f"\nPre-training Epoch {epoch + 1}/{config.sum_pretrain_epochs}")
-        
-        # Shuffle Phase-1 data
-        shuffled_data = phase1_data.copy()
-        random.shuffle(shuffled_data)
-        
-        # Generate negatives on-the-fly with 1:1 ratio
-        all_examples = []
-        for pos_example in shuffled_data:
-            all_examples.append(pos_example)
-            # Generate 1 negative per positive
-            negs, _ = generate_negatives_for_positive(pos_example, negative_example_ratio=1.0)
-            all_examples.extend(negs)
-        
-        random.shuffle(all_examples)
-        
-        epoch_losses = []
-        epoch_maes = []
-        
-        # Training batches
-        for batch_idx, start in enumerate(tqdm(
-            range(0, len(all_examples), config.sum_pretrain_batch_size),
-            desc="Pre-training"
-        )):
-            batch_data = all_examples[start:start + config.sum_pretrain_batch_size]
-            if not batch_data:
-                continue
-            
-            # Stack observations and masks
-            batch_obs = torch.stack([d['obs'] for d in batch_data]).to(device)
-            batch_masks = torch.stack([d['mask'] for d in batch_data]).to(device)
-            
-            # Forward pass
-            policy.train()
-            logits, value, sum_predictions = policy(batch_obs, batch_masks)
-            
-            # Compute sum prediction loss only
-            batch_losses = []
-            batch_maes = []
-            grids = (batch_obs[:, 0, :, :] * 9.0).cpu().numpy().astype(np.uint8)
-            phases = batch_obs[:, 3, 0, 0].cpu().numpy()
-            
-            for b in range(batch_obs.size(0)):
-                if phases[b] > 0.5:  # Phase-1 only
-                    # Extract anchor position
-                    anchor_mask = batch_obs[b, 2, :, :].cpu().numpy()
-                    anchor_pos = np.argwhere(anchor_mask > 0.5)
-                    if len(anchor_pos) == 0:
-                        continue
-                    r1, c1 = int(anchor_pos[0][0]), int(anchor_pos[0][1])
-                    
-                    # Get grid and compute actual sums
-                    grid = grids[b]
-                    temp_env.reset(grid=grid.copy())
-                    mask = batch_masks[b].cpu().numpy()
-                    valid_indices = np.where(mask)[0]
-                    
-                    actual_sums = np.zeros(170, dtype=np.float32)
-                    for extent_idx in valid_indices:
-                        r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
-                        if 0 <= r2 < 10 and 0 <= c2 < 17 and r1 <= r2 and c1 <= c2:
-                            actual_sum = temp_env.box_sum(r1, c1, r2, c2)
-                            actual_sums[extent_idx] = float(actual_sum)
-                    
-                    # Compute MSE loss
-                    if len(valid_indices) > 0:
-                        valid_sum_predictions = sum_predictions[b][valid_indices]
-                        valid_actual_sums = torch.from_numpy(actual_sums[valid_indices]).to(device)
-                        mse_loss = F.mse_loss(valid_sum_predictions, valid_actual_sums)
-                        batch_losses.append(mse_loss)
-                        mae = torch.mean(torch.abs(valid_sum_predictions - valid_actual_sums))
-                        batch_maes.append(mae.item())
-            
-            if batch_losses:
-                loss = torch.stack(batch_losses).mean()
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip_norm)
-                optimizer.step()
-                
-                epoch_losses.append(loss.item())
-                epoch_maes.extend(batch_maes)
-        
-        # Logging
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-        avg_mae = np.mean(epoch_maes) if epoch_maes else 0.0
-        
-        print(f"  Loss: {avg_loss:.4f}, MAE: {avg_mae:.4f}")
-        
-        # Log to wandb
-        wandb.log({
-            "pretrain/epoch": epoch + 1,
-            "pretrain/loss": avg_loss,
-            "pretrain/mae": avg_mae,
-        })
-    
-    # Unfreeze all parameters for main training
-    for param in policy.parameters():
-        param.requires_grad = True
-    
-    print("\n" + "="*60)
-    print("PRE-TRAINING COMPLETE - Starting main training")
-    print("="*60 + "\n")
 
 
 def train(config: Config):
@@ -237,8 +93,8 @@ def train(config: Config):
         extra_jsonl=config.extra_jsonl,
     )
     
-    # create model
-    policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170).to(device)
+    # create model with dropout for regularization
+    policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170, dropout=config.dropout).to(device)
     if config.init_checkpoint:
         state_dict = torch.load(config.init_checkpoint, map_location=device)
         policy.load_state_dict(state_dict)
@@ -264,11 +120,13 @@ def train(config: Config):
     ])
     print(f"Optimizer: Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e} (multiplier={config.phase1_lr_multiplier})")
     
-    # Sum prediction pre-training (completely separate from main training epochs)
-    if config.sum_pretrain_epochs > 0:
-        pretrain_sum_prediction(config, policy, phase1_data, device)
+    # Note: Sum prediction pre-training should be done separately using pretrain_sum_prediction.py
+    # If you want to use a pre-trained checkpoint, pass it via --init_checkpoint
+    if config.init_checkpoint:
+        print(f"Using pre-trained checkpoint: {config.init_checkpoint}")
+        print("  (If this was from pretrain_sum_prediction.py, the sum prediction head is already trained)")
     
-    # Main training loop (epochs are independent of pre-training)
+    # Main training loop
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
