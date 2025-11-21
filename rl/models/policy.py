@@ -11,8 +11,15 @@ class CNNPolicy(nn.Module):
     Architecture:
     - Conv2d(4, 32, 3x3) → GroupNorm → GELU → Conv2d(32, 64, 3x3) → GroupNorm → GELU
     - Flatten → Linear(64*8*15, 256) → GELU → LayerNorm
-    - Policy head: Linear(256, action_dim)
+    - Phase-0 head: Linear(256, action_dim) - anchor selection
+    - Phase-1 head: Linear(256 + 64, action_dim) - extent selection with anchor embedding
+    - Anchor embedding: Embedding(170, 64) - conditions Phase-1 on selected anchor (increased from 32 to 64 dims)
+    - Sum prediction head: Linear(256, action_dim) - auxiliary task (not used in policy)
     - Value head: Linear(256, 1)
+    
+    Key design: Sum predictions are decoupled from Phase-1 policy head to avoid gradient
+    interference. Phase-1 uses anchor embedding instead to explicitly model anchor-extent
+    dependency.
     """
     
     def __init__(
@@ -53,13 +60,18 @@ class CNNPolicy(nn.Module):
         # separate policy heads for Phase-0 (anchor selection) and Phase-1 (extent selection)
         self.phase0_head = nn.Linear(256, action_dim)  # anchor selection
         
-        # sum prediction head: predicts rectangle sum for each extent action
-        # Only used in Phase-1 (extent selection)
-        self.sum_prediction_head = nn.Linear(256, action_dim)  # sum prediction for each extent
+        # anchor embedding: embeds anchor position for Phase-1 conditioning
+        # 170 possible anchors (10 rows * 17 cols)
+        # Increased from 32 to 64 dims for better anchor-extent relationship modeling
+        self.anchor_embedding = nn.Embedding(170, 64)  # [170, 64]
         
-        # Phase-1 head: concatenates features with sum predictions
-        # Input: 256 (features) + action_dim (sum predictions) = 256 + action_dim
-        self.phase1_head = nn.Linear(256 + action_dim, action_dim)  # extent selection
+        # Phase-1 head: uses features + anchor embedding (decoupled from sum predictions)
+        # Input: 256 (features) + 64 (anchor embedding) = 320
+        self.phase1_head = nn.Linear(256 + 64, action_dim)  # extent selection
+        
+        # sum prediction head: auxiliary task only (not used in policy forward)
+        # Predicts rectangle sum for each extent, trained separately with MSE loss
+        self.sum_prediction_head = nn.Linear(256, action_dim)  # sum prediction for each extent
         
         # value head
         self.value_head = nn.Linear(256, 1)
@@ -95,13 +107,20 @@ class CNNPolicy(nn.Module):
         # Phase-0: anchor selection (no sum prediction needed)
         phase0_logits = self.phase0_head(x)  # [batch, action_dim]
         
-        # Phase-1: extent selection (with sum prediction)
-        # First, predict sums for all extent candidates
-        sum_predictions = self.sum_prediction_head(x)  # [batch, action_dim]
+        # Phase-1: extent selection (with anchor conditioning, decoupled from sum predictions)
+        # Extract anchor position from channel 2 and convert to flat index
+        anchor_mask = obs[:, 2, :, :]  # [batch, 10, 17] - anchor mask channel
+        anchor_indices = self._anchor_mask_to_indices(anchor_mask)  # [batch] - anchor flat indices
         
-        # Concatenate features with sum predictions for Phase-1 head
-        phase1_features = torch.cat([x, sum_predictions], dim=1)  # [batch, 256 + action_dim]
+        # Get anchor embeddings
+        anchor_emb = self.anchor_embedding(anchor_indices)  # [batch, 64]
+        
+        # Concatenate features with anchor embedding (NOT sum predictions)
+        phase1_features = torch.cat([x, anchor_emb], dim=1)  # [batch, 256 + 64]
         phase1_logits = self.phase1_head(phase1_features)  # [batch, action_dim]
+        
+        # Sum predictions: computed separately as auxiliary task (not used in policy)
+        sum_predictions = self.sum_prediction_head(x)  # [batch, action_dim]
         
         # Select logits based on phase
         # use torch.where to select: if is_phase1, use phase1_logits, else phase0_logits
@@ -192,4 +211,32 @@ class CNNPolicy(nn.Module):
         logprobs_tensor = torch.stack(logprobs)
         
         return actions_tensor, logprobs_tensor, value
+    
+    def _anchor_mask_to_indices(self, anchor_mask: torch.Tensor) -> torch.Tensor:
+        """Convert anchor mask [batch, 10, 17] to flat anchor indices [batch].
+        
+        Args:
+            anchor_mask: [batch, 10, 17] binary mask where 1.0 indicates anchor position
+            
+        Returns:
+            anchor_indices: [batch] flat anchor indices in range [0, 169]
+        """
+        batch_size = anchor_mask.size(0)
+        anchor_indices = []
+        
+        for b in range(batch_size):
+            # Find the position where anchor_mask[b] > 0.5
+            anchor_pos = torch.nonzero(anchor_mask[b] > 0.5, as_tuple=False)
+            if anchor_pos.numel() == 0:
+                # No anchor found (shouldn't happen in Phase-1, but handle gracefully)
+                # Default to (0, 0) if no anchor is set
+                anchor_indices.append(0)
+            else:
+                # Take first anchor position if multiple (shouldn't happen)
+                r1, c1 = anchor_pos[0, 0].item(), anchor_pos[0, 1].item()
+                # Convert to flat index: r1 * 17 + c1
+                anchor_idx = r1 * 17 + c1
+                anchor_indices.append(anchor_idx)
+        
+        return torch.tensor(anchor_indices, device=anchor_mask.device, dtype=torch.long)
 

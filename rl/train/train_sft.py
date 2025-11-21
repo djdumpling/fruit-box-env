@@ -37,6 +37,7 @@ class Config:
     epochs: int = 200
     batch_size: int = 128  # increased for more stable gradients
     lr: float = 3e-5  # further lowered learning rate for stability (was 5e-5)
+    phase1_lr_multiplier: float = 1.5  # Phase-1 learning rate multiplier (Phase-1 gets lr * 1.5 = 4.5e-5)
     weight_decay: float = 1e-5
     grad_clip_norm: float = 7.0  # increased gradient clipping threshold (was 5.0) to allow larger gradients
     
@@ -72,6 +73,7 @@ class Config:
     
     # curriculum learning
     curriculum_legal_only_epochs: int = 15  # extended legal-only period (was 10) to give model stronger foundation before illegal actions
+    curriculum_phase1_legal_only_epochs: int = 25  # Phase-1 specific legal-only period (10 epochs longer than Phase-0) to give Phase-1 more foundation
     use_curriculum: bool = True  # enable curriculum learning
     
     # turn-aware curriculum (filter by turn number and adjust extent limits)
@@ -1226,20 +1228,41 @@ def train(config: Config):
     else:
         print("Model created from scratch")
     
-    # create optimizer
-    optimizer = torch.optim.Adam(policy.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    # create optimizer with separate learning rates for Phase-0 and Phase-1
+    # Phase-0 parameters: feature extractor, phase0_head, value_head, sum_prediction_head
+    # Phase-1 parameters: phase1_head, anchor_embedding
+    phase0_params = []
+    phase1_params = []
+    
+    for name, param in policy.named_parameters():
+        if 'phase1_head' in name or 'anchor_embedding' in name:
+            phase1_params.append(param)
+        else:
+            phase0_params.append(param)
+    
+    optimizer = torch.optim.Adam([
+        {'params': phase0_params, 'lr': config.lr, 'weight_decay': config.weight_decay},
+        {'params': phase1_params, 'lr': config.lr * config.phase1_lr_multiplier, 'weight_decay': config.weight_decay}
+    ])
+    print(f"Optimizer: Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e} (multiplier={config.phase1_lr_multiplier})")
     
     # training loop
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         
         # curriculum learning: use legal-only masks for first N epochs
-        use_legal_only_masks = (config.use_curriculum and 
-                               epoch < config.curriculum_legal_only_epochs)
-        if use_legal_only_masks:
-            print(f"  Curriculum: Using legal-only masks (epoch {epoch + 1} < {config.curriculum_legal_only_epochs})")
+        # Phase-0 and Phase-1 have separate legal-only periods
+        use_legal_only_masks_phase0 = (config.use_curriculum and 
+                                      epoch < config.curriculum_legal_only_epochs)
+        use_legal_only_masks_phase1 = (config.use_curriculum and 
+                                      epoch < config.curriculum_phase1_legal_only_epochs)
+        
+        if use_legal_only_masks_phase0 or use_legal_only_masks_phase1:
+            phase0_status = f"legal-only (epoch {epoch + 1} < {config.curriculum_legal_only_epochs})" if use_legal_only_masks_phase0 else "all-geometric"
+            phase1_status = f"legal-only (epoch {epoch + 1} < {config.curriculum_phase1_legal_only_epochs})" if use_legal_only_masks_phase1 else "all-geometric"
+            print(f"  Curriculum: Phase-0={phase0_status}, Phase-1={phase1_status}")
         else:
-            print(f"  Curriculum: Using all-geometric masks with set-based losses")
+            print(f"  Curriculum: Using all-geometric masks with set-based losses for both phases")
         
         # combine Phase-0 and Phase-1 positive examples only
         all_positive_data = phase0_data + phase1_data
@@ -1331,13 +1354,14 @@ def train(config: Config):
         current_max_extent_size = max(current_max_extent_size, config.max_extent_size_early)
         
         # Gradual illegal exposure: start at 0 during legal-only period, then ramp up
-        if use_legal_only_masks:
+        # Use Phase-1 legal-only period as the reference (longer, so more conservative)
+        if use_legal_only_masks_phase1:
             # During legal-only period: no negative examples
             current_negative_ratio = 0.0
         else:
             # After legal-only period: gradually increase negative ratio
-            # Compute progress from end of legal-only period
-            epochs_since_legal_only = max(0, epoch - config.curriculum_legal_only_epochs + 1)
+            # Compute progress from end of Phase-1 legal-only period (longer, more conservative)
+            epochs_since_legal_only = max(0, epoch - config.curriculum_phase1_legal_only_epochs + 1)
             if config.negative_ratio_warmup_epochs <= 0:
                 negative_ratio_progress = 1.0
             else:
@@ -1404,7 +1428,7 @@ def train(config: Config):
         if config.extent_curriculum_epochs > 0:
             print(f"  Extent curriculum progress={extent_curriculum_progress:.2f} "
                   f"(max extent size={current_max_extent_size})")
-        if not use_legal_only_masks:
+        if not (use_legal_only_masks_phase0 and use_legal_only_masks_phase1):
             print(f"  Set-based weights this epoch → alpha={current_illegal_mass_alpha:.2f}, "
                   f"beta={current_illegal_mass_beta:.2f}, topk_delta={current_topk_illegal_delta:.2f}")
         print(f"  Sum-head loss weight={current_sum_pred_loss_weight:.3f} (progress={sum_loss_progress:.2f})")
@@ -1556,19 +1580,30 @@ def train(config: Config):
                     # Phase-1: legal extents
                     legal_actions_sets.append(d.get('legal_extents_set', set()))
             
-            # update masks based on curriculum learning
-            if use_legal_only_masks:
-                # curriculum phase: use legal-only masks (reconstruct from legal sets)
-                updated_masks = []
-                for i, d in enumerate(batch_data):
+            # update masks based on curriculum learning (phase-specific)
+            # Check phase for each example to apply phase-specific legal-only masks
+            updated_masks = []
+            for i, d in enumerate(batch_data):
+                phase = d.get('phase', 0)
+                use_legal_only = (use_legal_only_masks_phase0 if phase == 0 else use_legal_only_masks_phase1)
+                
+                if use_legal_only:
+                    # curriculum phase: use legal-only masks (reconstruct from legal sets)
                     mask = torch.zeros(170, dtype=torch.bool)
                     legal_set = legal_actions_sets[i]
                     for legal_idx in legal_set:
                         if legal_idx < 170 and legal_idx > 0:  # Skip idx=0 (dr=0, dc=0)
                             mask[legal_idx] = True
                     updated_masks.append(mask)
-                batch_masks = torch.stack(updated_masks).to(device)
-            else:
+                else:
+                    # full phase: use all-geometric masks (already in batch_data)
+                    mask = d["mask"] if d["mask"].shape[0] == 170 else torch.cat([d["mask"], torch.zeros(170 - d["mask"].shape[0], dtype=torch.bool)])
+                    updated_masks.append(mask)
+            
+            batch_masks = torch.stack(updated_masks).to(device)
+            
+            # Old code path (kept for reference but now handled above)
+            if False:  # disabled - using phase-specific logic above
                 # full phase: use all-geometric masks (already in batch_data)
                 batch_masks = torch.stack([
                     d["mask"] if d["mask"].shape[0] == 170 
@@ -1601,7 +1636,9 @@ def train(config: Config):
                 ], dtype=torch.long).to(device)
             
             # forward pass with set-based losses (only when not in curriculum phase)
-            use_set_based = not use_legal_only_masks
+            # Use set-based losses when at least one phase is out of legal-only period
+            # This allows Phase-0 to use set-based losses while Phase-1 is still in legal-only
+            use_set_based = not (use_legal_only_masks_phase0 and use_legal_only_masks_phase1)
             loss, info = compute_sft_loss(
                 policy, batch_obs, batch_actions, batch_masks, batch_is_positive,
                 negative_loss_weight=current_negative_loss_weight,
@@ -1724,7 +1761,7 @@ def train(config: Config):
             print(f"  Hard negative mining: {hard_negative_count}/{total_negative_count} ({hard_negative_ratio:.2%})")
         if extent_sizes:
             print(f"  Extent size: avg={avg_extent_size:.2f}, max={max_extent_size}")
-        if not use_legal_only_masks:
+        if not (use_legal_only_masks_phase0 and use_legal_only_masks_phase1):
             print(f"  Set-based losses: Illegal mass={avg_illegal_mass:.4f}, Top-K illegal={avg_topk_illegal:.4f}, Legal mass={avg_legal_mass:.4f}")
         
         # log example moves
@@ -1790,7 +1827,7 @@ def train(config: Config):
             # log histogram of extent sizes
             if len(extent_sizes) > 0:
                 log_dict["train/extent_size_hist"] = wandb.Histogram(extent_sizes)
-        if not use_legal_only_masks:
+        if not (use_legal_only_masks_phase0 and use_legal_only_masks_phase1):
             log_dict["train/illegal_mass"] = avg_illegal_mass
             log_dict["train/topk_illegal"] = avg_topk_illegal
             log_dict["train/legal_mass"] = avg_legal_mass
