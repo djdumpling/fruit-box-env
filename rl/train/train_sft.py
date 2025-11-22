@@ -31,6 +31,52 @@ from rl.train.sft_loss import compute_sft_loss
 from rl.train.sft_logging import log_example_moves
 
 
+def is_wandb_artifact(path: str) -> bool:
+    """Check if a path is a wandb artifact reference.
+    
+    Args:
+        path: Path string (e.g., 'checkpoints/policy.pt' or 'entity/project/artifact-name:v0')
+    
+    Returns:
+        True if path looks like a wandb artifact (contains '/' and ':' and doesn't exist as local file)
+    """
+    return "/" in path and ":" in path and not Path(path).exists()
+
+
+def load_checkpoint_from_wandb(artifact_path: str) -> str:
+    """Download checkpoint from wandb artifact and return local path.
+    
+    Args:
+        artifact_path: Wandb artifact path (e.g., 'djdumpling-yale/fruit-box-sft/sum-pretrained-checkpoint:v0')
+    
+    Returns:
+        Local path to the checkpoint file
+    """
+    print(f"Downloading wandb artifact: {artifact_path}")
+    # Initialize wandb run to access artifacts
+    # Note: This creates a temporary run just for artifact access
+    run = wandb.init()
+    try:
+        artifact = run.use_artifact(artifact_path, type='model')
+        artifact_dir = artifact.download()
+        
+        # Find the checkpoint file in the artifact directory
+        artifact_path_obj = Path(artifact_dir)
+        checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+        
+        if not checkpoint_files:
+            raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+        
+        if len(checkpoint_files) > 1:
+            print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+        
+        checkpoint_path = str(checkpoint_files[0])
+        print(f"Downloaded checkpoint to: {checkpoint_path}")
+        return checkpoint_path
+    finally:
+        wandb.finish()
+
+
 def train(config: Config):
     """Main training loop"""
     # initialize wandb (always enabled)
@@ -96,35 +142,65 @@ def train(config: Config):
     # create model with dropout for regularization
     policy = CNNPolicy(obs_shape=(4, 10, 17), action_dim=170, dropout=config.dropout).to(device)
     if config.init_checkpoint:
-        state_dict = torch.load(config.init_checkpoint, map_location=device)
+        # Check if checkpoint is a wandb artifact and download if needed
+        checkpoint_path = config.init_checkpoint
+        if is_wandb_artifact(checkpoint_path):
+            checkpoint_path = load_checkpoint_from_wandb(checkpoint_path)
+        
+        state_dict = torch.load(checkpoint_path, map_location=device)
         policy.load_state_dict(state_dict)
         print(f"Model initialized from checkpoint: {config.init_checkpoint}")
     else:
         print("Model created from scratch")
     
-    # create optimizer with separate learning rates for Phase-0 and Phase-1
-    # Phase-0 parameters: feature extractor, phase0_head, value_head, sum_prediction_head
-    # Phase-1 parameters: phase1_head, anchor_embedding
-    phase0_params = []
-    phase1_params = []
-    
-    for name, param in policy.named_parameters():
-        if 'phase1_head' in name or 'anchor_embedding' in name:
-            phase1_params.append(param)
-        else:
-            phase0_params.append(param)
-    
-    optimizer = torch.optim.Adam([
-        {'params': phase0_params, 'lr': config.lr, 'weight_decay': config.weight_decay},
-        {'params': phase1_params, 'lr': config.lr * config.phase1_lr_multiplier, 'weight_decay': config.weight_decay}
-    ])
-    print(f"Optimizer: Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e} (multiplier={config.phase1_lr_multiplier})")
-    
-    # Note: Sum prediction pre-training should be done separately using pretrain_sum_prediction.py
-    # If you want to use a pre-trained checkpoint, pass it via --init_checkpoint
+    # create optimizer with separate learning rates
+    # If using pre-trained checkpoint: 3 parameter groups (pre-trained, Phase-0, Phase-1)
+    # Otherwise: 2 parameter groups (Phase-0, Phase-1)
     if config.init_checkpoint:
+        # Pre-trained components get lower LR to prevent catastrophic forgetting
+        # Pre-trained: feature_extractor (conv layers, fc, ln) + sum_prediction_head
+        # Phase-0: phase0_head + value_head (untrained, need normal LR)
+        # Phase-1: phase1_head + anchor_embedding (untrained, need higher LR)
+        pretrained_params = []
+        phase0_params = []
+        phase1_params = []
+        
+        for name, param in policy.named_parameters():
+            if 'phase1_head' in name or 'anchor_embedding' in name:
+                phase1_params.append(param)
+            elif 'phase0_head' in name or 'value_head' in name:
+                phase0_params.append(param)
+            else:
+                # feature_extractor (conv1, conv2, gn1, gn2, fc, ln, dropout_layer) + sum_prediction_head
+                pretrained_params.append(param)
+        
+        pretrained_lr = config.lr * config.pretrained_lr_multiplier
+        optimizer = torch.optim.Adam([
+            {'params': pretrained_params, 'lr': pretrained_lr, 'weight_decay': config.weight_decay},
+            {'params': phase0_params, 'lr': config.lr, 'weight_decay': config.weight_decay},
+            {'params': phase1_params, 'lr': config.lr * config.phase1_lr_multiplier, 'weight_decay': config.weight_decay}
+        ])
         print(f"Using pre-trained checkpoint: {config.init_checkpoint}")
-        print("  (If this was from pretrain_sum_prediction.py, the sum prediction head is already trained)")
+        print(f"Optimizer (3 groups): Pre-trained LR={pretrained_lr:.2e}, Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e}")
+        print(f"  Pre-trained components (feature_extractor + sum_prediction_head) use lower LR to preserve learned representations")
+    else:
+        # Standard 2-group setup when training from scratch
+        # Phase-0 parameters: feature extractor, phase0_head, value_head, sum_prediction_head
+        # Phase-1 parameters: phase1_head, anchor_embedding
+        phase0_params = []
+        phase1_params = []
+        
+        for name, param in policy.named_parameters():
+            if 'phase1_head' in name or 'anchor_embedding' in name:
+                phase1_params.append(param)
+            else:
+                phase0_params.append(param)
+        
+        optimizer = torch.optim.Adam([
+            {'params': phase0_params, 'lr': config.lr, 'weight_decay': config.weight_decay},
+            {'params': phase1_params, 'lr': config.lr * config.phase1_lr_multiplier, 'weight_decay': config.weight_decay}
+        ])
+        print(f"Optimizer (2 groups): Phase-0 LR={config.lr:.2e}, Phase-1 LR={config.lr * config.phase1_lr_multiplier:.2e} (multiplier={config.phase1_lr_multiplier})")
     
     # Main training loop
     for epoch in range(config.epochs):
@@ -321,8 +397,10 @@ def train(config: Config):
                 1.0,
                 (epoch + 1) / max(config.sum_prediction_loss_warmup_epochs, 1),
             )
+        # Use lower initial weight if using pre-trained checkpoint (sum head already well-trained)
+        sum_loss_start = config.sum_prediction_loss_start_pretrained if config.init_checkpoint else config.sum_prediction_loss_start
         current_sum_pred_loss_weight = interp(
-            config.sum_prediction_loss_start,
+            sum_loss_start,
             config.sum_prediction_loss_weight,
             sum_loss_progress,
         )
@@ -805,19 +883,23 @@ def train(config: Config):
 
 
 def main():
+    # Use Config defaults for CLI argument defaults to ensure consistency
+    config_defaults = Config()
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--dataset_name", type=str, default="djdumpling/fruit-box-minimal-area")
-    parser.add_argument("--dataset_split", type=str, default="train")
-    parser.add_argument("--extra_jsonl", type=str, default=None, help="Optional local JSONL with corrective data")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=20)
-    parser.add_argument("--init_checkpoint", type=str, default=None, help="Optional initial checkpoint to warm start")
-    parser.add_argument("--negative_example_ratio", type=float, default=2.0, help="Ratio of negative examples per positive")
+    parser.add_argument("--seed", type=int, default=config_defaults.seed)
+    parser.add_argument("--epochs", type=int, default=config_defaults.epochs)
+    parser.add_argument("--batch_size", type=int, default=config_defaults.batch_size)
+    parser.add_argument("--lr", type=float, default=config_defaults.lr)
+    parser.add_argument("--weight_decay", type=float, default=config_defaults.weight_decay)
+    parser.add_argument("--dataset_name", type=str, default=config_defaults.dataset_name)
+    parser.add_argument("--dataset_split", type=str, default=config_defaults.dataset_split)
+    parser.add_argument("--extra_jsonl", type=str, default=config_defaults.extra_jsonl, help="Optional local JSONL with corrective data")
+    parser.add_argument("--checkpoint_dir", type=str, default=config_defaults.checkpoint_dir)
+    parser.add_argument("--checkpoint_interval", type=int, default=config_defaults.checkpoint_interval)
+    parser.add_argument("--init_checkpoint", type=str, default=config_defaults.init_checkpoint, 
+                       help="Optional initial checkpoint to warm start (local path or wandb artifact, e.g., 'djdumpling-yale/fruit-box-sft/sum-pretrained-checkpoint:v0')")
+    parser.add_argument("--negative_example_ratio", type=float, default=config_defaults.negative_example_ratio, help="Ratio of negative examples per positive")
     args = parser.parse_args()
     
     config = Config(

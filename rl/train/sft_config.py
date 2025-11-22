@@ -16,6 +16,7 @@ class Config:
     batch_size: int = 128  # increased for more stable gradients
     lr: float = 3e-5  # further lowered learning rate for stability (was 5e-5)
     phase1_lr_multiplier: float = 1.5  # Phase-1 learning rate multiplier (Phase-1 gets lr * 1.5 = 4.5e-5)
+    pretrained_lr_multiplier: float = 0.2  # LR multiplier for pre-trained components (feature_extractor + sum_prediction_head) when loading checkpoint (0.2 = 6e-6)
     weight_decay: float = 1e-4  # increased from 1e-5 to 1e-4 for stronger regularization to prevent overfitting
     dropout: float = 0.1  # dropout probability for regularization (applied after LayerNorm in policy network)
     grad_clip_norm: float = 7.0  # increased gradient clipping threshold (was 5.0) to allow larger gradients
@@ -48,6 +49,7 @@ class Config:
     # auxiliary head warmup
     sum_prediction_loss_weight: float = 0.1  # target weight for sum prediction head
     sum_prediction_loss_start: float = 0.02  # initial weight before warmup
+    sum_prediction_loss_start_pretrained: float = 0.01  # lower initial weight when using pre-trained checkpoint (already well-trained)
     sum_prediction_loss_warmup_epochs: int = 15  # warmup to delay sum prediction loss (finish at epoch 15, during curriculum)
     
     # sum prediction pre-training (runs before main training, separate epochs)
