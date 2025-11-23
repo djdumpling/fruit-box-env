@@ -53,28 +53,25 @@ def load_checkpoint_from_wandb(artifact_path: str) -> str:
         Local path to the checkpoint file
     """
     print(f"Downloading wandb artifact: {artifact_path}")
-    # Initialize wandb run to access artifacts
-    # Note: This creates a temporary run just for artifact access
-    run = wandb.init()
-    try:
-        artifact = run.use_artifact(artifact_path, type='model')
-        artifact_dir = artifact.download()
-        
-        # Find the checkpoint file in the artifact directory
-        artifact_path_obj = Path(artifact_dir)
-        checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
-        
-        if not checkpoint_files:
-            raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
-        
-        if len(checkpoint_files) > 1:
-            print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
-        
-        checkpoint_path = str(checkpoint_files[0])
-        print(f"Downloaded checkpoint to: {checkpoint_path}")
-        return checkpoint_path
-    finally:
-        wandb.finish()
+    # Use wandb.Api() to download artifacts without initializing a run
+    # This avoids interfering with any existing wandb run
+    api = wandb.Api()
+    artifact = api.artifact(artifact_path, type='model')
+    artifact_dir = artifact.download()
+    
+    # Find the checkpoint file in the artifact directory
+    artifact_path_obj = Path(artifact_dir)
+    checkpoint_files = list(artifact_path_obj.glob("*.pt")) + list(artifact_path_obj.glob("*.pth"))
+    
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No checkpoint file (.pt or .pth) found in artifact directory: {artifact_dir}")
+    
+    if len(checkpoint_files) > 1:
+        print(f"Warning: Multiple checkpoint files found, using: {checkpoint_files[0]}")
+    
+    checkpoint_path = str(checkpoint_files[0])
+    print(f"Downloaded checkpoint to: {checkpoint_path}")
+    return checkpoint_path
 
 
 def train(config: Config):
@@ -720,6 +717,10 @@ def train(config: Config):
                 batch_masks_for_logging = batch_masks
         
         # logging
+        if not epoch_losses:
+            print(f"Warning: No batches processed in epoch {epoch + 1}, skipping logging")
+            continue
+        
         avg_loss = np.mean([d['loss'] for d in epoch_losses])
         avg_negative_accuracy = np.mean([d.get('negative_accuracy', 0.0) for d in epoch_losses])
         total_legal_predictions = sum(d.get('legal_predictions', 0) for d in epoch_losses)
