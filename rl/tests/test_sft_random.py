@@ -151,11 +151,12 @@ def test_policy_with_visualization(
         move_num = 0
         total_valid = 0
         total_reward = 0
+        executed_moves = []  # Track executed moves for state replay
         
         for move_num in range(max_moves_per_grid):
             print(f"\n--- Move {move_num + 1} ---")
             
-            # Phase-0: Get anchor
+            # Phase-0: Get top-3 anchors
             phase0_obs = obs.unsqueeze(0).to(device)
             phase0_mask = wrapped_env.get_action_mask()
             
@@ -169,86 +170,135 @@ def test_policy_with_visualization(
                 print("No valid anchors available. Game over.")
                 break
             
-            # Get top anchor from policy
+            # Get top-3 anchor choices from policy
             with torch.no_grad():
                 logits, _, _ = policy(phase0_obs, phase0_mask)  # ignore value and sum_predictions
                 valid_indices = torch.nonzero(phase0_mask[0], as_tuple=False).squeeze(-1)
                 if valid_indices.numel() == 0:
                     break
                 valid_logits = logits[0][valid_indices]
-                top_idx_compact = torch.argmax(valid_logits).item()
-                anchor_idx = valid_indices[top_idx_compact].item()
-            
-            r1, c1 = flat_idx_to_anchor(anchor_idx)
-            print(f"Phase-0: Selected anchor ({r1}, {c1})")
-            
-            # Step Phase-0
-            obs_after_anchor, _, _, _, _ = wrapped_env.step(anchor_idx)
-            
-            # Phase-1: Get extent
-            phase1_obs = obs_after_anchor.unsqueeze(0).to(device)
-            phase1_mask = wrapped_env.get_action_mask()
-            
-            if phase1_mask.shape[0] < 170:
-                padded = torch.zeros(170, dtype=torch.bool)
-                padded[:phase1_mask.shape[0]] = phase1_mask
-                phase1_mask = padded
-            phase1_mask = phase1_mask.unsqueeze(0).to(device)
-            
-            if phase1_mask.sum() == 0:
-                print("No valid extents available. Trying next anchor...")
-                continue
-            
-            # Get top extent from policy
-            with torch.no_grad():
-                logits, _, _ = policy(phase1_obs, phase1_mask)  # ignore value and sum_predictions
-                valid_indices = torch.nonzero(phase1_mask[0], as_tuple=False).squeeze(-1)
-                if valid_indices.numel() == 0:
-                    continue
-                valid_logits = logits[0][valid_indices]
-                top_idx_compact = torch.argmax(valid_logits).item()
-                extent_idx = valid_indices[top_idx_compact].item()
-            
-            width = 17 - c1
-            r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
-            print(f"Phase-1: Selected extent index {extent_idx} -> ({r2}, {c2})")
-            
-            # Show top-3 extent choices for debugging
-            if valid_indices.numel() > 1:
+                # Get top-3 choices (or fewer if less than 3 available)
                 k = min(3, valid_indices.numel())
                 topk_values, topk_indices_compact = torch.topk(valid_logits, k)
-                print(f"  Top-{k} extent choices:")
-                for i, (val, idx_compact) in enumerate(zip(topk_values, topk_indices_compact)):
-                    ext_idx = valid_indices[idx_compact].item()
-                    er2, ec2 = flat_idx_to_extent(r1, c1, ext_idx)
-                    area = (er2 - r1 + 1) * (ec2 - c1 + 1)
-                    print(f"    {i+1}. Index {ext_idx} -> ({er2}, {ec2}) [Area: {area}, Logit: {val.item():.2f}]")
+                top_anchor_indices = [valid_indices[topk_indices_compact[i]].item() for i in range(k)]
             
-            # Check if action is valid
-            step_info = validation_env.step(r1, c1, r2, c2)
+            # Try all 9 combinations: top-3 anchors × top-3 extents for each anchor
+            move_success = False
+            step_info = None  # Initialize to avoid undefined variable
             
-            print_action(r1, c1, r2, c2, step_info.valid, step_info.sum, step_info.reward)
-            
-            if not step_info.valid:
-                # Show what legal moves were available
-                print_legal_moves(validation_env)
-            
-            if step_info.valid:
-                total_valid += 1
-                total_reward += step_info.reward
-                print_grid(validation_env.grid, f"Grid after move {move_num + 1}")
-                obs = torch.from_numpy(validation_env.grid.copy()).float().unsqueeze(0)
-                # Update wrapped_env to match
-                env = Sum10GymEnv(initial_grid=validation_env.grid.copy())
-                wrapped_env = TwoPhaseWrapper(env, curriculum_legal_only=False, curriculum_updates=0)
-                wrapped_env.reset()
-                obs, _ = wrapped_env.reset()
+            for anchor_attempt_idx, anchor_idx in enumerate(top_anchor_indices):
+                r1, c1 = flat_idx_to_anchor(anchor_idx)
                 
-                if step_info.done:
-                    print("\nGame completed (no more legal moves)!")
+                # Save state before trying this anchor - recreate wrapped_env from current validation_env state
+                wrapped_env_save = TwoPhaseWrapper(
+                    Sum10GymEnv(initial_grid=initial_grid.copy()),
+                    curriculum_legal_only=False,
+                    curriculum_updates=0
+                )
+                wrapped_env_save.reset()
+                # Replay all previous valid moves to get back to current state
+                for prev_r1, prev_c1, prev_r2, prev_c2 in executed_moves:
+                    anchor_idx_prev = prev_r1 * 17 + prev_c1
+                    wrapped_env_save.step(anchor_idx_prev)  # Phase-0
+                    # Find extent index for phase-1
+                    width = 17 - prev_c1
+                    extent_idx_prev = (prev_r2 - prev_r1) * width + (prev_c2 - prev_c1)
+                    wrapped_env_save.step(extent_idx_prev)  # Phase-1
+                
+                # step Phase-0
+                obs_after_anchor, reward, terminated, truncated, info = wrapped_env_save.step(anchor_idx)
+                
+                # phase-1: use ALL geometrically valid extents (not just legal ones)
+                phase1_obs = obs_after_anchor.unsqueeze(0).to(device)
+                phase1_mask = wrapped_env_save.get_action_mask()  # ALL geometrically valid extents
+                
+                # pad to 170 if needed
+                if phase1_mask.shape[0] < 170:
+                    padded = torch.zeros(170, dtype=torch.bool)
+                    padded[:phase1_mask.shape[0]] = phase1_mask
+                    phase1_mask = padded
+                phase1_mask = phase1_mask.unsqueeze(0).to(device)
+                
+                if phase1_mask.sum() == 0:
+                    # No valid extents for this anchor, try next anchor
+                    continue
+                
+                # Get top-3 extent choices from policy
+                with torch.no_grad():
+                    logits, _, _ = policy(phase1_obs, phase1_mask)  # ignore value and sum_predictions
+                    valid_indices = torch.nonzero(phase1_mask[0], as_tuple=False).squeeze(-1)
+                    if valid_indices.numel() == 0:
+                        # No valid extents, try next anchor
+                        continue
+                    valid_logits = logits[0][valid_indices]
+                    # Get top-3 choices (or fewer if less than 3 available)
+                    k = min(3, valid_indices.numel())
+                    topk_values, topk_indices_compact = torch.topk(valid_logits, k)
+                    top_extent_indices = [valid_indices[topk_indices_compact[i]].item() for i in range(k)]
+                
+                # Try all 3 extent choices for this anchor
+                for extent_attempt_idx, extent_idx in enumerate(top_extent_indices):
+                    r2, c2 = flat_idx_to_extent(r1, c1, extent_idx)
+                    
+                    # Create temp env to validate move without modifying validation_env
+                    if extent_attempt_idx == 0:
+                        # Create temp env only once per anchor attempt
+                        temp_validation_env = Sum10Env()
+                        temp_validation_env.reset(grid=initial_grid.copy())
+                        # Replay all previous valid moves
+                        for prev_r1, prev_c1, prev_r2, prev_c2 in executed_moves:
+                            temp_validation_env.step(prev_r1, prev_c1, prev_r2, prev_c2)
+                    
+                    # For subsequent extent attempts, reset to the same state
+                    if extent_attempt_idx > 0:
+                        # Reset and replay for subsequent attempts
+                        temp_validation_env.reset(grid=initial_grid.copy())
+                        for prev_r1, prev_c1, prev_r2, prev_c2 in executed_moves:
+                            temp_validation_env.step(prev_r1, prev_c1, prev_r2, prev_c2)
+                    
+                    # validate move
+                    step_info = temp_validation_env.step(r1, c1, r2, c2)
+                    is_valid = step_info.valid
+                    move_reward = step_info.reward if is_valid else 0
+                    
+                    if is_valid:
+                        # Valid move found! Execute it and break out of retry loops
+                        move_success = True
+                        
+                        print(f"Phase-0: Selected anchor ({r1}, {c1}) [attempt {anchor_attempt_idx + 1}/{len(top_anchor_indices)}]")
+                        print(f"Phase-1: Selected extent index {extent_idx} -> ({r2}, {c2}) [attempt {extent_attempt_idx + 1}/{len(top_extent_indices)}]")
+                        print_action(r1, c1, r2, c2, step_info.valid, step_info.sum, step_info.reward)
+                        
+                        total_valid += 1
+                        total_reward += move_reward
+                        executed_moves.append((r1, c1, r2, c2))
+                        
+                        # Update validation_env
+                        validation_env.step(r1, c1, r2, c2)
+                        
+                        # Step Phase-1 in wrapped_env_save (this actually executes the move and updates state)
+                        obs, reward, terminated, truncated, info = wrapped_env_save.step(extent_idx)
+                        wrapped_env = wrapped_env_save  # Use the successful state for next iteration
+                        
+                        print_grid(validation_env.grid, f"Grid after move {move_num + 1}")
+                        
+                        # Break out of extent loop
+                        break
+                
+                if move_success:
+                    # Check if game is done before breaking anchor loop
+                    if step_info is not None and step_info.done:
+                        print("\nGame completed (no more legal moves)!")
                     break
-            else:
-                print(f"\nInvalid move! Game ends. Sum was {step_info.sum}, expected 10.")
+            
+            if not move_success:
+                # No valid move found after trying all combinations
+                print(f"\nNo valid move found after trying all {len(top_anchor_indices)} anchors × 3 extents combinations. Game ends.")
+                break
+            
+            # Check if game is done after successful move
+            if step_info is not None and step_info.done:
+                print("\nGame completed (no more legal moves)!")
                 break
         
         print(f"\n--- Summary for Grid {grid_idx + 1} ---")
@@ -262,7 +312,7 @@ def test_policy_with_visualization(
 def main():
     parser = argparse.ArgumentParser(description="Test SFT policy on random grids.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to SFT checkpoint or wandb artifact")
-    parser.add_argument("--num_grids", type=int, default=5, help="Number of random grids to test (default: 5)")
+    parser.add_argument("--num_grids", type=int, default=50, help="Number of random grids to test (default: 50)")
     parser.add_argument("--max_moves", type=int, default=60, help="Maximum moves per grid")
     parser.add_argument("--seed", type=int, default=12345, help="Base RNG seed for grid generation")
     parser.add_argument("--collect_examples", action="store_true", help="Emit corrective examples")

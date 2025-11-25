@@ -6,3 +6,5 @@
 5. need to do some pre-training (teach the policy the rules, train only the prediction head and freeze other)
 
 6. (non-pretraining run) is overfitting, need to add validation monitoring/increase regularization/data augmentation
+
+7. when doing mask, need to account for turn #, action space, action, and mostly the reward. we don't care about the action as much as the reward, since we primarily care about the minimal area strategy reward instead of specific actions.
