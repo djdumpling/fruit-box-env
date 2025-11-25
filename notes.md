@@ -8,3 +8,25 @@
 6. (non-pretraining run) is overfitting, need to add validation monitoring/increase regularization/data augmentation
 
 7. when doing mask, need to account for turn #, action space, action, and mostly the reward. we don't care about the action as much as the reward, since we primarily care about the minimal area strategy reward instead of specific actions.
+
+———
+
+8. Overall Statistics:
+  Total grids tested: 100
+  Total moves: 4479
+  Total cells cleared: 10733
+  Average cells cleared per grid: 107.33
+
+Total Cells Cleared per Grid:
+  Mean: 107.33
+  Median: 107.00
+  Min: 79
+  Max: 140
+  Std: 12.22
+
+Moves per Grid:
+  Mean: 44.79
+  Median: 45.00
+  Min: 33
+  Max: 60
+  Std: 5.48
