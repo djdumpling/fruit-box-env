@@ -19,77 +19,88 @@ A Python-based puzzle game environment for generating datasets and training RL a
 ### Installation
 
 ```bash
-pip install numpy pandas matplotlib seaborn tqdm pyarrow
+pip install -e .
+# or with uv: uv pip install -e .
 ```
 
 ### Generate Data
 
-Generate episodes using different policies:
-
 ```bash
-# greedy policy (maximize cells cleared per move)
-python generate_dataset.py --policy greedy_area --episodes 1000 --out_dir out_data/greedy_1k
-
-# minimal policy (minimize cells cleared per move - opposite of greedy)
-python generate_dataset.py --policy minimal_area --episodes 1000 --out_dir out_data/minimal_1k
-
-# high-value pairs policy (prioritize (9,1), (8,2), (7,3) pairs first)
-python generate_dataset.py --policy high_value_pairs --episodes 1000 --out_dir out_data/high_value_1k
-
-# random policy
-python generate_dataset.py --policy random_legal --episodes 1000 --out_dir out_data/random_1k
-
-# look-ahead policy (3-step depth, sample 20 moves, discount 0.95)
-python generate_dataset.py --policy look_ahead:3:20:0.95 --episodes 1000 --out_dir out_data/lookahead_1k
+python policies/generate_dataset.py --policy <policy_name> --episodes 1000 --out_dir out_data/<name>
 ```
 
-**Output formats**: `jsonl` (default) or `parquet`
-
-```bash
-# add --format parquet at the end
-python generate_dataset.py --policy greedy_area --episodes 100 --format parquet
-```
-
-Download the HF data [here](https://huggingface.co/datasets/djdumpling/fruit-box).
+Available policies: `greedy_area`, `minimal_area`, `high_value_pairs`, `random_legal`, `look_ahead:3:20:0.95`. Output: `jsonl` (default) or `parquet` (`--format parquet`). Pre-generated data: [HuggingFace](https://huggingface.co/datasets/djdumpling/fruit-box).
 
 ## 📈 Policy Analysis
 
-Compare multiple policies and visualize their performance:
+Compare policies and visualize performance:
 
 ```bash
-python policy_analysis.py
+python policies/policy_analysis.py
 ```
 
-This generates `out_data/analysis/policy_comparisons.png` with distribution comparisons:
+Generates `out_data/analysis/policy_comparisons.png`:
 
 ![Policy Comparisons](out_data/analysis/policy_comparisons.png)
 
-## Dataset Merging
+## 🤖 Reinforcement Learning
 
-Combine multiple policy datasets into HuggingFace-compatible format:
+Complete RL pipeline achieving **94.4% performance** (top benchmark result). Two-stage training:
+
+### Stage 1: Supervised Fine-Tuning (SFT)
+
+Trains a CNN policy network on expert demonstrations to learn action legality. Uses set-based losses to penalize all illegal actions simultaneously and includes negative examples for robust legality learning.
 
 ```bash
-python merge_to_hf.py
+python rl/train/train_sft.py --dataset-name djdumpling/fruit-box
 ```
 
-**Output:**
-- `out_data/hf_dataset/train/train.parquet` - All trajectories combined
-- `out_data/hf_dataset/episodes.jsonl` - Episode-level metadata
+### Stage 2: Group Relative Policy Optimization (GRPO)
 
-The merged dataset includes trajectories from all policies found in `out_data/` with `trajectories.parquet` files.
+Fine-tunes the SFT policy with RL using a two-phase approach:
+- **Phase 0 (PPO)**: Stabilizes the policy with conservative updates
+- **Phase 1 (GRPO)**: Learns optimal strategy by comparing groups of actions sampled from the same anchor point, using relative advantages rather than absolute rewards
+
+```bash
+python rl/train/train_grpo.py --load-checkpoint artifacts/sft-checkpoint-epoch-120:v3/policy_sft_epoch120.pt
+```
+
+**Key features:**
+- CNN policy network with sum prediction head
+- Custom Gym environment wrapper with two-phase action space (anchor selection + extent selection)
+- Curriculum learning and exploration scheduling
+- Wandb integration for experiment tracking
+
+## Benchmark Results
+
+Model and policy performance comparison:
+
+![Benchmark Results](out_data/analysis/benchmark_with_best.png)
+
+## Dataset Merging
+
+Combine policy datasets into HuggingFace format:
+
+```bash
+python policies/merge_to_hf.py
+```
+
+Outputs `out_data/hf_dataset/train/train.parquet` and `out_data/hf_dataset/episodes.jsonl` from all `trajectories.parquet` files in `out_data/`.
 
 ## 📁 Project Structure
 
 ```
 fruit-box-env/
-├── generate_dataset.py    # Main data generation script
-├── policy_analysis.py     # Policy comparison and visualization
-├── merge_to_hf.py          # Dataset merging for HuggingFace
-├── out_data/               # Generated datasets
-│   ├── greedy_1k/          # Greedy policy episodes
-│   ├── random_1k/          # Random policy episodes
-│   ├── lookahead_1k/       # Look-ahead policy episodes
-│   ├── analysis/           # Policy comparison plots
-│   └── hf_dataset/         # Merged HuggingFace dataset
+├── policies/               # Data generation and analysis
+│   ├── generate_dataset.py
+│   ├── policy_analysis.py
+│   └── merge_to_hf.py
+├── rl/                     # RL training pipeline
+│   ├── train/              # SFT, GRPO, Q-learning
+│   ├── algo/               # PPO, GRPO algorithms
+│   ├── models/             # Policy network
+│   ├── envs/               # Gym wrappers
+│   └── eval.py
+├── out_data/               # Generated datasets and analysis
 └── README.md
 ```
