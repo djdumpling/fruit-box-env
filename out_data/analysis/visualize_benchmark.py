@@ -18,6 +18,7 @@ data_avg = {
     'grok-4-fast': 0.482,
     'gemini-2.5-pro': 0.435,
     'intellect-3': 0.292,
+    'glm-4.5': 0.255,
     'kimi-K2-thinking': 0.221,
     'gpt-4.1': 0.176,
     'gpt-4o': 0.074,
@@ -35,6 +36,7 @@ data_best3 = {
     'grok-4-fast': 0.646795,
     'gemini-2.5-pro': 0.589298,
     'intellect-3': 0.452,
+    'glm-4.5': 0.346,
     'kimi-K2-thinking': 0.392752,
     'gpt-4o': 0.101990,
     'deepseek-v3.1-terminus': 0.031216,
@@ -121,7 +123,8 @@ for bar_avg, avg_pct, best3_pct, model in zip(bars_avg, avg_percentages, best3_p
         ax.text(best3_pct + 0.5, bar_center_y,
                 combined_str, ha='left', va='center', fontsize=9, fontweight='bold')
     elif model in ['gpt-5', 'qwen3-235B-thinking', 'gemini-3-pro-preview', 'gpt-oss-120b', 
-                   'claude-sonnet-4.5', 'grok-4-fast', 'gemini-2.5-pro', 'intellect-3', 'kimi-K2-thinking']:
+                   'claude-sonnet-4.5', 'grok-4-fast', 'gemini-2.5-pro', 'intellect-3', 
+                   'kimi-K2-thinking', 'glm-4.5']:
         ax.text(avg_pct - 0.3, bar_center_y,
                 avg_str, ha='right', va='center', fontsize=9, fontweight='bold')
         if best3_pct > avg_pct:
