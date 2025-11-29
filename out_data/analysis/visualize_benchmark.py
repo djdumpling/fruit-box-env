@@ -3,6 +3,7 @@ import seaborn as sns
 import numpy as np
 import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
+from pathlib import Path
 
 sns.set_style("white")
 plt.rcParams['figure.figsize'] = (12, 8)
@@ -16,6 +17,7 @@ data_avg = {
     'claude-sonnet-4.5': 0.557,
     'grok-4-fast': 0.482,
     'gemini-2.5-pro': 0.435,
+    'intellect-3': 0.292,
     'kimi-K2-thinking': 0.221,
     'gpt-4.1': 0.176,
     'gpt-4o': 0.074,
@@ -32,6 +34,7 @@ data_best3 = {
     'claude-sonnet-4.5': 0.693418,
     'grok-4-fast': 0.646795,
     'gemini-2.5-pro': 0.589298,
+    'intellect-3': 0.452,
     'kimi-K2-thinking': 0.392752,
     'gpt-4o': 0.101990,
     'deepseek-v3.1-terminus': 0.031216,
@@ -96,7 +99,7 @@ else:
 
 extension_colors = extension_colors[::-1]
 
-fig, ax = plt.subplots(figsize=(10.5, 4.5))
+fig, ax = plt.subplots(figsize=(10.5, 5.5))
 ax.grid(False)
 
 bars_avg = ax.barh(models, avg_percentages, color=colors, edgecolor='none', height=0.8, alpha=0.7)
@@ -118,7 +121,7 @@ for bar_avg, avg_pct, best3_pct, model in zip(bars_avg, avg_percentages, best3_p
         ax.text(best3_pct + 0.5, bar_center_y,
                 combined_str, ha='left', va='center', fontsize=9, fontweight='bold')
     elif model in ['gpt-5', 'qwen3-235B-thinking', 'gemini-3-pro-preview', 'gpt-oss-120b', 
-                   'claude-sonnet-4.5', 'grok-4-fast', 'gemini-2.5-pro', 'kimi-K2-thinking']:
+                   'claude-sonnet-4.5', 'grok-4-fast', 'gemini-2.5-pro', 'intellect-3', 'kimi-K2-thinking']:
         ax.text(avg_pct - 0.3, bar_center_y,
                 avg_str, ha='right', va='center', fontsize=9, fontweight='bold')
         if best3_pct > avg_pct:
@@ -147,6 +150,6 @@ for label in ax.get_yticklabels():
 
 plt.subplots_adjust(top=0.93, bottom=0.12, left=0.15, right=0.95, hspace=0)
 
-output_path = 'out_data/analysis/fruit_box_benchmark.png'
+output_path = Path(__file__).parent / 'fruit_box_benchmark.png'
 plt.savefig(output_path, dpi=300, bbox_inches='tight')
 plt.show()
