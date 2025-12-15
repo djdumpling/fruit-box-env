@@ -10,6 +10,7 @@ plt.rcParams['figure.figsize'] = (12, 8)
 
 data_avg = {
     'RL': 0.944,
+    'gpt-5.2': 0.810,
     'gpt-5': 0.799,
     'qwen3-235B-thinking': 0.781,
     'gemini-3-pro-preview': 0.668,
@@ -28,6 +29,7 @@ data_avg = {
 }
 
 data_best3 = {
+    'gpt-5.2': 0.868,
     'qwen3-235B-thinking': 0.846418,
     'gpt-5': 0.834605,
     'gemini-3-pro-preview': 0.792880,

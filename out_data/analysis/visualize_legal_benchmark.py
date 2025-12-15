@@ -20,11 +20,13 @@ data = {
     "openai/gpt-5": 0.91413270964,
     "openai/gpt-5.1": 0.9963411896733334,
     "openai/gpt-oss-120b": 0.9075005377666667,
+    "openai/gpt-5.2": 0.983,
     "qwen/qwen3-235b-thinking": 0.37477857020666666,
     "x-ai/grok-4": 0.9916256908666666,
     "x-ai/grok-4-fast": 0.95262895631875,
     "prime-intellect/intellect-3": 0.570,
     "z-ai/glm-4.5": 0.595,
+
 }
 
 def clean_model_name(name):
@@ -63,7 +65,7 @@ for bar, score, model in zip(bars, scores, models):
             score_str, ha='left', va='center', fontsize=9, fontweight='bold')
 
 ax.set_xlabel('Score (%)', fontsize=12, fontweight='bold')
-ax.set_title('Fruit Box Start Legal Bench', fontsize=20, fontweight='bold', pad=20)
+ax.set_title('Fruit Box Legal Bench', fontsize=20, fontweight='bold', pad=20)
 ax.set_xlim(0, 107)
 
 ax.tick_params(axis='y', labelsize=12)
