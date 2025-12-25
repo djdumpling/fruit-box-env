@@ -1,0 +1,32 @@
+1. need to strengthen phase-1 learning since illegal extents are more numerous (harder task)
+2. am thinking of making the first 10-20 epochs only legal, then doing curriculm learning by gradually expanding 
+3. need to incorporate the turn number of the game (cuz like turn<25, can pretty safely choose small extents; but once turn>25, there are many more larger extents since "holes" have been cleared)
+
+4. currently, the sum-prediction (170-dim ??) is concatenated with features (256-dim). also gradient interference.
+5. need to do some pre-training (teach the policy the rules, train only the prediction head and freeze other)
+
+6. (non-pretraining run) is overfitting, need to add validation monitoring/increase regularization/data augmentation
+
+7. when doing mask, need to account for turn #, action space, action, and mostly the reward. we don't care about the action as much as the reward, since we primarily care about the minimal area strategy reward instead of specific actions.
+
+———
+
+8. Overall Statistics:
+  Total grids tested: 100
+  Total moves: 4479
+  Total cells cleared: 10733
+  Average cells cleared per grid: 107.33
+
+Total Cells Cleared per Grid:
+  Mean: 107.33
+  Median: 107.00
+  Min: 79
+  Max: 140
+  Std: 12.22
+
+Moves per Grid:
+  Mean: 44.79
+  Median: 45.00
+  Min: 33
+  Max: 60
+  Std: 5.48
